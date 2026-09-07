@@ -11,15 +11,23 @@ import argparse
 import csv
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 
 HEX_BYTE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
+HEX_BYTE_RAW = re.compile(rb"(?<![0-9A-Fa-f])([0-9A-Fa-f]{2})(?![0-9A-Fa-f])")
 RX_MARKER = re.compile(r"\b(?:rx|recv|receive|received)\b|接收|收到|<<|←", re.IGNORECASE)
 TX_MARKER = re.compile(r"\b(?:tx|send|sent)\b|发送|发出|>>|→", re.IGNORECASE)
 TIMESTAMP_PREFIX = re.compile(r"^\s*(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*")
+TIMESTAMP_PREFIX_RAW = re.compile(rb"^\s*(?:\[(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\])?\s*")
+
+# SSCOM 5.00a's traditional-Chinese direction glyphs are stored as these
+# byte sequences, which are not decodable by normal GBK tables.  Detecting
+# them at byte level is therefore more reliable than decoding with replacement.
+SSCOM_TX_LABEL = bytes.fromhex("B7 A2 A1 FA A1 F3")
+SSCOM_RX_LABEL = bytes.fromhex("CA D5 A1 FB A1 F4")
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,55 @@ class CycleResult:
     expected: int
     missing: int
     included: bool
+    first: int = 0
+    last: int = 0
+    duplicates: int = 0
+    missing_values: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class CycleModel:
+    first_sequence: int
+    last_sequence: int
+    expected: int
+    evidence_cycles: int
+
+
+@dataclass(frozen=True)
+class LoggedChunk:
+    direction: str
+    chunk: object
+
+
+@dataclass
+class DirectionRead:
+    rx_chunks: list = field(default_factory=list)
+    tx_chunks: list = field(default_factory=list)
+    unknown_chunks: list = field(default_factory=list)
+    records: list[LoggedChunk] = field(default_factory=list)
+    direction_markers_found: bool = False
+    native_sscom_markers: int = 0
+
+    @property
+    def direction_confidence(self) -> float:
+        known = len(self.rx_chunks) + len(self.tx_chunks)
+        total = known + len(self.unknown_chunks)
+        return known / total if total else 0.0
+
+
+@dataclass(frozen=True)
+class TransactionSummary:
+    sent: int
+    received: int
+    paired: int
+    unmatched_sent: int
+    orphan_received: int
+    key_confirmed: int
+    latency_ms: tuple[float, ...]
+
+    @property
+    def average_latency_ms(self) -> float | None:
+        return sum(self.latency_ms) / len(self.latency_ms) if self.latency_ms else None
 
 
 def parse_hex(value: str) -> bytes:
@@ -59,10 +116,81 @@ def parse_hex(value: str) -> bytes:
 
 
 def read_bytes(path: Path) -> bytes:
-    # SSCOM exports commonly contain spaces/newlines/timestamps.  The frame
-    # header below is used to find valid frames in the resulting byte stream.
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
-    return bytes(int(token.group(), 16) for token in HEX_BYTE.finditer(text))
+    """Read all payload bytes, never interpreting timestamp digits as HEX."""
+    parsed = read_directional_chunks(path)
+    return b"".join(record.chunk.data for record in parsed.records)
+
+
+def _timestamp_and_body(raw_line: bytes) -> tuple[datetime | None, bytes]:
+    match = TIMESTAMP_PREFIX_RAW.match(raw_line)
+    if not match:
+        return None, raw_line
+    timestamp = None
+    if match.group(2):
+        try:
+            date = (match.group(1) or b"1900-01-01").decode("ascii").replace("/", "-")
+            clock = match.group(2).decode("ascii").replace(",", ".")
+            timestamp = datetime.fromisoformat(f"{date} {clock}")
+        except ValueError:
+            pass
+    return timestamp, raw_line[match.end() :]
+
+
+def _direction_and_payload(body: bytes) -> tuple[str | None, bytes, bool]:
+    stripped = body.lstrip()
+    if stripped.startswith(SSCOM_TX_LABEL):
+        return "tx", stripped[len(SSCOM_TX_LABEL) :], True
+    if stripped.startswith(SSCOM_RX_LABEL):
+        return "rx", stripped[len(SSCOM_RX_LABEL) :], True
+    # Modern terminal exports often use readable ASCII labels.  Latin-1 keeps
+    # their bytes losslessly; the Chinese labels above were handled first.
+    ascii_prefix = stripped[:32].decode("latin1", errors="ignore")
+    is_rx = bool(RX_MARKER.search(ascii_prefix))
+    is_tx = bool(TX_MARKER.search(ascii_prefix))
+    if is_rx != is_tx:
+        return ("rx" if is_rx else "tx"), stripped, False
+    return None, stripped, False
+
+
+def _payload_bytes(body: bytes) -> bytes:
+    return bytes(int(token, 16) for token in HEX_BYTE_RAW.findall(body))
+
+
+def read_directional_chunks(path: Path) -> DirectionRead:
+    """Read SSCOM logs while preserving RX/TX evidence and timestamps.
+
+    An unmarked continuation line inherits the immediately preceding direction.
+    If the whole file has no direction labels it is deliberately marked
+    ``unknown`` rather than silently calling it RX; the compatibility wrapper
+    still returns those bytes for plain HEX logs.
+    """
+    from frame_parser import RxChunk
+
+    result = DirectionRead()
+    active_direction: str | None = None
+    for line_no, raw_line in enumerate(path.read_bytes().splitlines(), start=1):
+        timestamp, body = _timestamp_and_body(raw_line)
+        direction, payload_text, native = _direction_and_payload(body)
+        if direction:
+            result.direction_markers_found = True
+            active_direction = direction
+            if native:
+                result.native_sscom_markers += 1
+        elif active_direction:
+            direction = active_direction
+        payload = _payload_bytes(payload_text)
+        if not payload:
+            continue
+        chunk = RxChunk(payload, timestamp, line_no)
+        final_direction = direction or "unknown"
+        result.records.append(LoggedChunk(final_direction, chunk))
+        if final_direction == "rx":
+            result.rx_chunks.append(chunk)
+        elif final_direction == "tx":
+            result.tx_chunks.append(chunk)
+        else:
+            result.unknown_chunks.append(chunk)
+    return result
 
 
 def read_receive_chunks(path: Path):
@@ -72,36 +200,10 @@ def read_receive_chunks(path: Path):
     marker exists the complete HEX stream is returned, so plain HEX exports
     remain usable; callers should display that limitation to the user.
     """
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
-    from frame_parser import RxChunk
-
-    active_rx = False
-    found_marker = False
-    rx_lines = 0
-    chunks = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        is_rx = bool(RX_MARKER.search(line))
-        is_tx = bool(TX_MARKER.search(line))
-        if is_rx or is_tx:
-            found_marker = True
-            active_rx = is_rx and not is_tx
-        timestamp = None
-        payload = line
-        match = TIMESTAMP_PREFIX.match(line)
-        if match:
-            payload = line[match.end():]
-            try:
-                stamp = f"{match.group(1) or '1900-01-01'} {match.group(2).replace(',', '.')}"
-                timestamp = datetime.fromisoformat(stamp.replace('/', '-'))
-            except ValueError:
-                pass
-        tokens = list(HEX_BYTE.finditer(payload))
-        if active_rx and tokens:
-            chunks.append(RxChunk(bytes(int(token.group(), 16) for token in tokens), timestamp, line_no))
-            rx_lines += 1
-    if not found_marker:
-        return [RxChunk(read_bytes(path))], False, 0
-    return chunks, True, rx_lines
+    parsed = read_directional_chunks(path)
+    if not parsed.direction_markers_found:
+        return parsed.unknown_chunks, False, 0
+    return parsed.rx_chunks, True, len(parsed.rx_chunks)
 
 
 def read_receive_bytes(path: Path) -> tuple[bytes, bool, int]:
@@ -172,13 +274,36 @@ def detect_protocol(stream: bytes) -> Detection | None:
     return Detection(header, frame_size, best_seq[1], best_seq[2], best_seq[3], confidence)
 
 
-def analyze_cycles(sequences: list[int]) -> tuple[int, list[CycleResult]] | None:
-    """Analyze repeated, ascending sequence-number sweeps.
+def detect_sequence_field(captured: list[bytes]) -> tuple[int, int, str] | None:
+    """Suggest a monotonically increasing field from already extracted frames."""
+    if len(captured) < 4:
+        return None
+    best: tuple[float, int, int, str] | None = None
+    shortest = min(map(len, captured))
+    for size in (1, 2, 4):
+        for offset in range(0, shortest - size + 1):
+            for endian in ("little", "big"):
+                values = [int.from_bytes(frame[offset : offset + size], endian) for frame in captured]
+                modulus = 1 << (size * 8)
+                advances = [(right - left) % modulus for left, right in zip(values, values[1:])]
+                normal = sum(advance == 1 for advance in advances)
+                short_gap = sum(2 <= advance <= 32 for advance in advances)
+                duplicates = sum(advance == 0 for advance in advances)
+                score = normal + short_gap * 0.55 - duplicates * 0.25
+                if best is None or score > best[0]:
+                    best = (score, offset, size, endian)
+    if best is None or best[0] < 2:
+        return None
+    return best[1], best[2], best[3]
 
-    A decrease starts a new sweep.  The expected count is inferred from the
-    most frequent sweep span (with the largest span used to break ties).  A
-    sweep with fewer than half of the expected unique sequence values is
-    considered an incomplete acquisition and excluded from the average.
+
+def analyze_cycles(sequences: list[int]) -> tuple[CycleModel, list[CycleResult]] | None:
+    """Analyze ascending sweeps without turning partial logs into a tiny cycle.
+
+    A decrease is a *candidate* boundary.  The sequence domain is accepted
+    only when at least two broad sweeps independently show the same outer
+    range.  This fixes the common failure mode where several short fragments
+    make a span of 5 look more frequent than the real 1..86 cycle.
     """
     if len(sequences) < 6:
         return None
@@ -193,16 +318,75 @@ def analyze_cycles(sequences: list[int]) -> tuple[int, list[CycleResult]] | None
     spans = [max(group) - min(group) + 1 for group in groups if len(group) >= 2]
     if len(spans) < 2:
         return None
-    frequencies = {span: spans.count(span) for span in set(spans)}
-    expected = max(frequencies, key=lambda span: (frequencies[span], span))
-    if expected < 2:
+    largest_span = max(spans)
+    # A broad sweep can have internal packet loss, but must cover 80% of the
+    # best observed range to become evidence for the theoretical domain.
+    broad = [group for group in groups if len(group) >= 2 and max(group) - min(group) + 1 >= largest_span * 0.8]
+    if len(broad) < 2:
+        return None
+    ranges = [(min(group), max(group)) for group in broad]
+    range_counts = {candidate: ranges.count(candidate) for candidate in set(ranges)}
+    first, last = max(range_counts, key=lambda candidate: (range_counts[candidate], candidate[1] - candidate[0]))
+    evidence_cycles = range_counts[(first, last)]
+    expected = last - first + 1
+    if expected < 2 or evidence_cycles < 2:
         return None
     results: list[CycleResult] = []
     for index, group in enumerate(groups, start=1):
-        received = len(set(group))
-        missing = max(0, expected - received)
-        results.append(CycleResult(index, received, expected, missing, received * 2 >= expected))
-    return expected, results
+        unique = set(group)
+        present = {value for value in unique if first <= value <= last}
+        missing_values = tuple(value for value in range(first, last + 1) if value not in present)
+        received = len(present)
+        results.append(
+            CycleResult(
+                index, received, expected, len(missing_values), received * 2 >= expected,
+                min(group), max(group), len(group) - len(unique), missing_values,
+            )
+        )
+    return CycleModel(first, last, expected, evidence_cycles), results
+
+
+def detect_modbus_rtu(chunks: list) -> tuple[list[bytes], object] | None:
+    """Return verified Modbus RTU frames when CRC establishes the profile."""
+    from frame_parser import CrcKind, FrameConfig, FrameProtocol, parse_chunks
+
+    if not chunks:
+        return None
+    parsed = parse_chunks(chunks, FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS))
+    # Do not label random data as Modbus: at least three CRC-valid frames and
+    # at least 80% of logged receive records must be explained.
+    if len(parsed.frames) < 3 or len(parsed.frames) < len(chunks) * 0.8:
+        return None
+    return parsed.frames, parsed
+
+
+def match_transactions(direction_read: DirectionRead) -> TransactionSummary:
+    """Pair each TX with the next RX; never use this for RX loss statistics."""
+    waiting = []
+    paired = orphan = key_confirmed = 0
+    latencies: list[float] = []
+    for record in direction_read.records:
+        if record.direction == "tx":
+            waiting.append(record.chunk)
+        elif record.direction == "rx":
+            if not waiting:
+                orphan += 1
+                continue
+            tx = waiting.pop(0)
+            paired += 1
+            # Some devices wrap a Modbus request in a proprietary header.  A
+            # matching address/function pair anywhere in TX is evidence, not
+            # a prerequisite for the chronological pairing.
+            if len(record.chunk.data) >= 2 and record.chunk.data[:2] in (tx.data[index : index + 2] for index in range(max(0, len(tx.data) - 1))):
+                key_confirmed += 1
+            if tx.timestamp and record.chunk.timestamp:
+                elapsed = (record.chunk.timestamp - tx.timestamp).total_seconds() * 1000
+                if elapsed >= 0:
+                    latencies.append(elapsed)
+    return TransactionSummary(
+        len(direction_read.tx_chunks), len(direction_read.rx_chunks), paired,
+        len(waiting), orphan, key_confirmed, tuple(latencies),
+    )
 
 
 def write_gaps(path: Path, gaps: list[Gap]) -> None:

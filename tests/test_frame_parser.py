@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from frame_parser import CrcKind, FrameConfig, RxChunk, crc16_modbus, parse_chunks
+from frame_parser import CrcKind, FrameConfig, FrameProtocol, RxChunk, crc16_modbus, parse_chunks
 
 
 class FrameParserTests(unittest.TestCase):
@@ -39,6 +39,16 @@ class FrameParserTests(unittest.TestCase):
         )
         self.assertEqual(result.truncations, 1)
         self.assertEqual(len(result.frames), 1)
+
+    def test_modbus_response_can_be_split_across_receives(self):
+        body = b"\x2E\x03\x02\x12\x34"
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        result = parse_chunks(
+            [RxChunk(frame[:3]), RxChunk(frame[3:])],
+            FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS),
+        )
+        self.assertEqual(result.frames, [frame])
+        self.assertEqual(result.crc_errors, 0)
 
 
 if __name__ == "__main__":

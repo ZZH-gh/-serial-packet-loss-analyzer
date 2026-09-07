@@ -17,9 +17,17 @@ class CrcKind(str, Enum):
     CCITT = "crc16-ccitt"
 
 
+class FrameProtocol(str, Enum):
+    """How a frame start and its length are identified."""
+
+    CUSTOM = "custom"
+    MODBUS_RTU = "modbus-rtu"
+
+
 @dataclass(frozen=True)
 class FrameConfig:
-    header: bytes
+    header: bytes = b""
+    protocol: FrameProtocol = FrameProtocol.CUSTOM
     fixed_length: int | None = None
     length_offset: int | None = None
     length_size: int = 1
@@ -30,6 +38,20 @@ class FrameConfig:
     max_frame_gap_ms: int | None = None
 
     def frame_length(self, data: bytes) -> int | None:
+        if self.protocol is FrameProtocol.MODBUS_RTU:
+            # A Modbus RTU response has an arbitrary slave address followed by
+            # a function code.  For read responses byte 2 is the byte count;
+            # the final two bytes are CRC16.  Write responses are always 8 B.
+            if len(data) < 2:
+                return None
+            function = data[1] & 0x7F
+            if data[1] & 0x80:
+                return 5 if len(data) >= 2 else None
+            if function in (1, 2, 3, 4):
+                return data[2] + 5 if len(data) >= 3 else None
+            if function in (5, 6, 15, 16):
+                return 8
+            return -1
         if self.fixed_length is not None:
             return self.fixed_length
         if self.length_offset is None:
@@ -99,14 +121,14 @@ def valid_crc(frame: bytes, config: FrameConfig) -> bool:
 
 
 def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
-    if not config.header:
+    if config.protocol is FrameProtocol.CUSTOM and not config.header:
         raise ValueError("header must not be empty")
     result, buffer, pending_at = ParseResult(), bytearray(), None
 
     def classify_incomplete(reason: str) -> None:
         nonlocal pending_at
         expected = config.frame_length(buffer)
-        if buffer.startswith(config.header):
+        if config.protocol is FrameProtocol.MODBUS_RTU or buffer.startswith(config.header):
             result.events.append(ParseEvent("truncated", len(buffer), expected, reason))
         buffer.clear()
         pending_at = None
@@ -114,16 +136,33 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
     def consume() -> None:
         nonlocal pending_at
         while buffer:
-            start = buffer.find(config.header)
-            if start < 0:
-                # Preserve a possible partial header at the tail.
-                keep = min(len(config.header) - 1, len(buffer))
-                dropped = len(buffer) - keep
-                if dropped:
-                    result.noise_bytes += dropped
-                    result.events.append(ParseEvent("noise", dropped, detail="bytes before frame header"))
-                    del buffer[:dropped]
-                return
+            if config.protocol is FrameProtocol.MODBUS_RTU:
+                # A plausible Modbus frame starts with arbitrary address then
+                # a supported function.  Scan only to recover from a corrupt
+                # prefix; CRC is still mandatory before emitting a frame.
+                start = next(
+                    (index for index in range(max(0, len(buffer) - 1)) if (buffer[index + 1] & 0x7F) in (1, 2, 3, 4, 5, 6, 15, 16)),
+                    -1,
+                )
+                if start < 0:
+                    keep = min(1, len(buffer))
+                    dropped = len(buffer) - keep
+                    if dropped:
+                        result.noise_bytes += dropped
+                        result.events.append(ParseEvent("noise", dropped, detail="bytes before Modbus function"))
+                        del buffer[:dropped]
+                    return
+            else:
+                start = buffer.find(config.header)
+                if start < 0:
+                    # Preserve a possible partial header at the tail.
+                    keep = min(len(config.header) - 1, len(buffer))
+                    dropped = len(buffer) - keep
+                    if dropped:
+                        result.noise_bytes += dropped
+                        result.events.append(ParseEvent("noise", dropped, detail="bytes before frame header"))
+                        del buffer[:dropped]
+                    return
             if start:
                 result.noise_bytes += start
                 result.events.append(ParseEvent("noise", start, detail="bytes before frame header"))
@@ -131,12 +170,16 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
             expected = config.frame_length(buffer)
             if expected is None:
                 return
-            if expected < len(config.header) + (2 if config.crc is not CrcKind.NONE else 0):
+            minimum = 3 if config.protocol is FrameProtocol.MODBUS_RTU else len(config.header) + (2 if config.crc is not CrcKind.NONE else 0)
+            if expected < minimum:
                 result.events.append(ParseEvent("invalid_length", len(buffer), expected))
                 del buffer[0]
                 continue
             if len(buffer) < expected:
-                later = buffer.find(config.header, 1)
+                # For arbitrary-address Modbus frames a payload byte can look
+                # like a function code, so a later candidate is not evidence
+                # of truncation.  Keep buffering until timeout/EOF instead.
+                later = -1 if config.protocol is FrameProtocol.MODBUS_RTU else buffer.find(config.header, 1)
                 if later > 0:
                     result.events.append(ParseEvent("truncated", later, expected, "next header before expected tail"))
                     del buffer[:later]
