@@ -8,6 +8,7 @@ argument (so dropping a file on the EXE also works).
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -39,6 +40,8 @@ class LossAnalyzerApp:
         self.max_gap = StringVar(value="1000")
         self.cycle_coverage = StringVar(value="50")
         self.transaction_timeout = StringVar(value="1500")
+        self.manual_cycle_start = StringVar(value="")
+        self.manual_cycle_count = StringVar(value="")
         self.crc = StringVar(value=CrcKind.NONE.value)
         self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV 文件，或点击“选择日志文件”。")
         self.gaps: list[Gap] = []
@@ -50,6 +53,7 @@ class LossAnalyzerApp:
         self.direction_read = None
         self.transaction_note = ""
         self.evidence_rows: list[dict[str, str]] = []
+        self.last_report: dict | None = None
         self._build()
 
     def _build(self) -> None:
@@ -95,6 +99,8 @@ class LossAnalyzerApp:
             ("CRC", self.crc, 14),
             ("循环纳入阈值(%)", self.cycle_coverage, 14),
             ("收发超时(ms,0关闭)", self.transaction_timeout, 14),
+            ("手动循环起始序号", self.manual_cycle_start, 14),
+            ("手动理论帧数", self.manual_cycle_count, 14),
         ]
         for column, (label, variable, width) in enumerate(fields):
             row = (column // 4) * 2
@@ -124,6 +130,8 @@ class LossAnalyzerApp:
         self.export_button.pack(side=LEFT, padx=8)
         self.evidence_export_button = ttk.Button(buttons, text="导出解析证据 CSV", command=self.export_evidence, state="disabled")
         self.evidence_export_button.pack(side=LEFT)
+        self.report_export_button = ttk.Button(buttons, text="导出复现报告 JSON", command=self.export_report, state="disabled")
+        self.report_export_button.pack(side=LEFT, padx=(4, 0))
 
         ttk.Label(outer, textvariable=self.result, justify="left", font=("Consolas", 10)).pack(anchor="w", pady=(0, 8))
         notebook = ttk.Notebook(outer)
@@ -215,7 +223,8 @@ class LossAnalyzerApp:
             "profile": self.profile.get(), "header": self.header.get(), "frame_size": self.frame_size.get(),
             "seq_offset": self.seq_offset.get(), "seq_size": self.seq_size.get(), "endian": self.endian.get(),
             "max_gap": self.max_gap.get(), "crc": self.crc.get(), "cycle_coverage": self.cycle_coverage.get(),
-            "transaction_timeout": self.transaction_timeout.get(),
+            "transaction_timeout": self.transaction_timeout.get(), "manual_cycle_start": self.manual_cycle_start.get(),
+            "manual_cycle_count": self.manual_cycle_count.get(),
         }
 
     def save_profile(self) -> None:
@@ -246,7 +255,8 @@ class LossAnalyzerApp:
                 ("profile", self.profile), ("header", self.header), ("frame_size", self.frame_size),
                 ("seq_offset", self.seq_offset), ("seq_size", self.seq_size), ("endian", self.endian),
                 ("max_gap", self.max_gap), ("crc", self.crc), ("cycle_coverage", self.cycle_coverage),
-                ("transaction_timeout", self.transaction_timeout),
+                ("transaction_timeout", self.transaction_timeout), ("manual_cycle_start", self.manual_cycle_start),
+                ("manual_cycle_count", self.manual_cycle_count),
             ):
                 if key in values:
                     variable.set(str(values[key]))
@@ -259,6 +269,17 @@ class LossAnalyzerApp:
         if value < 0:
             raise ValueError("收发超时不能小于 0。")
         return value or None
+
+    def manual_cycle_values(self) -> tuple[int | None, int | None]:
+        start_text, count_text = self.manual_cycle_start.get().strip(), self.manual_cycle_count.get().strip()
+        if not start_text and not count_text:
+            return None, None
+        if not start_text or not count_text:
+            raise ValueError("手动循环需要同时填写起始序号和理论帧数，或两项都留空自动推断。")
+        start, count = int(start_text), int(count_text)
+        if count < 2:
+            raise ValueError("手动理论帧数必须至少为 2。")
+        return start, count
 
     def choose_file(self) -> None:
         filename = filedialog.askopenfilename(
@@ -287,8 +308,10 @@ class LossAnalyzerApp:
         self.table.delete(*self.table.get_children())
         self.evidence.delete(*self.evidence.get_children())
         self.evidence_rows = []
+        self.last_report = None
         self.export_button.configure(state="disabled")
         self.evidence_export_button.configure(state="disabled")
+        self.report_export_button.configure(state="disabled")
         self.auto_detect(silent=True)
 
     def auto_detect(self, silent: bool = False) -> None:
@@ -372,6 +395,7 @@ class LossAnalyzerApp:
             max_gap = int(self.max_gap.get())
             coverage = float(self.cycle_coverage.get()) / 100
             self.transaction_timeout_value()
+            manual_start, manual_count = self.manual_cycle_values()
             if not is_modbus and frame_size <= len(header):
                 raise ValueError("总帧长必须大于帧头长度。")
             if seq_offset < 0 or (frame_size is not None and seq_offset + seq_size > frame_size):
@@ -401,7 +425,7 @@ class LossAnalyzerApp:
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
                 raise ValueError("没有找到完整帧。请检查帧头和总帧长。")
-            cyclic = analyze_cycles(sequences, coverage)
+            cyclic = analyze_cycles(sequences, coverage, manual_start, manual_count)
         except (OSError, ValueError) as error:
             messagebox.showerror("无法统计", str(error))
             return
@@ -410,6 +434,7 @@ class LossAnalyzerApp:
         self.cycle_results = []
         self.gaps = []
         self.cyclic_mode = cyclic is not None
+        analysis_stats = {}
         if cyclic is not None:
             model, self.cycle_results = cyclic
             expected = model.expected
@@ -428,9 +453,17 @@ class LossAnalyzerApp:
             raw_missing = sum(cycle.missing for cycle in self.cycle_results)
             raw_received = sum(cycle.received for cycle in self.cycle_results)
             raw_rate = 100 * raw_missing / (raw_received + raw_missing) if raw_received + raw_missing else 0.0
+            analysis_stats = {
+                "mode": "cycle", "sequence_range": [model.first_sequence, model.last_sequence],
+                "expected_per_cycle": expected, "domain_evidence_cycles": model.evidence_cycles,
+                "coverage_threshold_percent": coverage * 100, "all_cycles_loss_percent": raw_rate,
+                "included_cycles_loss_percent": rate,
+                "cycles": [{"index": cycle.index, "received": cycle.received, "missing": cycle.missing, "included": cycle.included, "missing_sequence_ids": list(cycle.missing_values)} for cycle in self.cycle_results],
+            }
             self.result.set(
                 f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n循环模式：自动识别每轮理论帧数为 {expected}。共 {len(self.cycle_results)} 轮，纳入 {len(included)} 轮，忽略 {ignored} 轮。\n"
-                f"理论序号范围：{model.first_sequence}..{model.last_sequence}，由 {model.evidence_cycles} 个完整范围循环共同证实。\n"
+                f"理论序号范围：{model.first_sequence}..{model.last_sequence}，"
+                f"{'由使用者手动设定' if model.evidence_cycles == 0 else f'由 {model.evidence_cycles} 个完整范围循环共同证实'}。\n"
                 f"全部循环丢包率：{raw_rate:.4f}%；纳入循环的平均丢包率：{rate:.4f}%（少于 {expected * coverage:g} 帧，即 {coverage * 100:g}% 的循环未计入）。\n"
                 f"每轮的确切缺失序号可通过“导出缺失明细 CSV”复核。\n{self.transaction_note}"
             )
@@ -449,6 +482,11 @@ class LossAnalyzerApp:
                     resets += 1
             missing = sum(gap.count for gap in self.gaps)
             rate = 100 * missing / (len(sequences) + missing)
+            analysis_stats = {
+                "mode": "continuous", "received_frames": len(sequences), "missing_frames": missing,
+                "loss_percent": rate, "duplicates": duplicates, "restart_or_outlier": resets,
+                "gaps": [{"after": gap.after, "first_missing": gap.first_missing, "last_missing": gap.last_missing, "count": gap.count} for gap in self.gaps],
+            }
             self.set_table_headings((("after", "前一序号"), ("first", "首个缺失"), ("last", "最后缺失"), ("count", "缺失帧数")))
             for gap in self.gaps:
                 self.table.insert("", END, values=(gap.after, gap.first_missing, gap.last_missing, gap.count))
@@ -457,8 +495,36 @@ class LossAnalyzerApp:
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}\n{self.transaction_note}"
             )
         self.populate_evidence(parsed, sequences)
+        transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read else None
+        file_bytes = path.read_bytes()
+        self.last_report = {
+            "format": "serial-loss-analysis-report", "version": 1,
+            "input": {"file_name": path.name, "bytes": len(file_bytes), "sha256": hashlib.sha256(file_bytes).hexdigest()},
+            "parameters": self.profile_values(),
+            "direction": {
+                "markers_found": bool(self.direction_read and self.direction_read.direction_markers_found),
+                "rx_records": len(self.direction_read.rx_chunks) if self.direction_read else 0,
+                "tx_records": len(self.direction_read.tx_chunks) if self.direction_read else 0,
+                "unknown_records": len(self.direction_read.unknown_chunks) if self.direction_read else 0,
+                "confidence": self.direction_read.direction_confidence if self.direction_read else 0,
+            },
+            "frame_parsing": {
+                "complete_frames": len(captured), "truncations": parsed.truncations,
+                "crc_errors": parsed.crc_errors, "noise_bytes": parsed.noise_bytes,
+                "events": [{"kind": event.kind, "received": event.received, "expected": event.expected, "detail": event.detail} for event in parsed.events],
+            },
+            "statistics": analysis_stats,
+            "transactions": None if transaction is None else {
+                "sent": transaction.sent, "received": transaction.received, "paired": transaction.paired,
+                "unmatched_sent": transaction.unmatched_sent, "timed_out_sent": transaction.timed_out_sent,
+                "orphan_received": transaction.orphan_received, "key_confirmed": transaction.key_confirmed,
+                "average_latency_ms": transaction.average_latency_ms,
+            },
+            "evidence_csv_columns": ["frame", "lines", "time", "bytes", "sequence", "status"],
+        }
         self.export_button.configure(state="normal")
         self.evidence_export_button.configure(state="normal")
+        self.report_export_button.configure(state="normal")
 
     def export(self) -> None:
         filename = filedialog.asksaveasfilename(
@@ -497,6 +563,20 @@ class LossAnalyzerApp:
             writer = csv.DictWriter(output, fieldnames=("frame", "lines", "time", "bytes", "sequence", "status"))
             writer.writeheader()
             writer.writerows(self.evidence_rows)
+        messagebox.showinfo("导出完成", f"已保存：\n{filename}")
+
+    def export_report(self) -> None:
+        if not self.last_report:
+            messagebox.showwarning("暂无报告", "请先完成一次统计。")
+            return
+        filename = filedialog.asksaveasfilename(
+            title="保存可复现报告", defaultextension=".json", initialfile="serial-loss-analysis-report.json",
+            filetypes=(("JSON 文件", "*.json"),),
+        )
+        if not filename:
+            return
+        with Path(filename).open("w", encoding="utf-8") as output:
+            json.dump(self.last_report, output, ensure_ascii=False, indent=2)
         messagebox.showinfo("导出完成", f"已保存：\n{filename}")
 
 

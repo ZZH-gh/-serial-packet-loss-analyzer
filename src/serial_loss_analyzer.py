@@ -298,7 +298,10 @@ def detect_sequence_field(captured: list[bytes]) -> tuple[int, int, str] | None:
     return best[1], best[2], best[3]
 
 
-def analyze_cycles(sequences: list[int], min_coverage: float = 0.5) -> tuple[CycleModel, list[CycleResult]] | None:
+def analyze_cycles(
+    sequences: list[int], min_coverage: float = 0.5,
+    expected_start: int | None = None, expected_count: int | None = None,
+) -> tuple[CycleModel, list[CycleResult]] | None:
     """Analyze ascending sweeps without turning partial logs into a tiny cycle.
 
     A decrease is a *candidate* boundary.  The sequence domain is accepted
@@ -308,7 +311,7 @@ def analyze_cycles(sequences: list[int], min_coverage: float = 0.5) -> tuple[Cyc
     """
     if not 0 < min_coverage <= 1:
         raise ValueError("min_coverage must be in (0, 1]")
-    if len(sequences) < 6:
+    if len(sequences) < 2:
         return None
     groups: list[list[int]] = [[]]
     for value in sequences:
@@ -316,24 +319,29 @@ def analyze_cycles(sequences: list[int], min_coverage: float = 0.5) -> tuple[Cyc
             groups.append([])
         groups[-1].append(value)
     groups = [group for group in groups if group]
-    if len(groups) < 2:
-        return None
-    spans = [max(group) - min(group) + 1 for group in groups if len(group) >= 2]
-    if len(spans) < 2:
-        return None
-    largest_span = max(spans)
-    # A broad sweep can have internal packet loss, but must cover 80% of the
-    # best observed range to become evidence for the theoretical domain.
-    broad = [group for group in groups if len(group) >= 2 and max(group) - min(group) + 1 >= largest_span * 0.8]
-    if len(broad) < 2:
-        return None
-    ranges = [(min(group), max(group)) for group in broad]
-    range_counts = {candidate: ranges.count(candidate) for candidate in set(ranges)}
-    first, last = max(range_counts, key=lambda candidate: (range_counts[candidate], candidate[1] - candidate[0]))
-    evidence_cycles = range_counts[(first, last)]
-    expected = last - first + 1
-    if expected < 2 or evidence_cycles < 2:
-        return None
+    if expected_count is not None:
+        if expected_count < 2 or expected_start is None:
+            raise ValueError("manual cycle needs start and count")
+        first, last, expected, evidence_cycles = expected_start, expected_start + expected_count - 1, expected_count, 0
+    else:
+        if len(groups) < 2:
+            return None
+        spans = [max(group) - min(group) + 1 for group in groups if len(group) >= 2]
+        if len(spans) < 2:
+            return None
+        largest_span = max(spans)
+        # A broad sweep can have internal packet loss, but must cover 80% of the
+        # best observed range to become evidence for the theoretical domain.
+        broad = [group for group in groups if len(group) >= 2 and max(group) - min(group) + 1 >= largest_span * 0.8]
+        if len(broad) < 2:
+            return None
+        ranges = [(min(group), max(group)) for group in broad]
+        range_counts = {candidate: ranges.count(candidate) for candidate in set(ranges)}
+        first, last = max(range_counts, key=lambda candidate: (range_counts[candidate], candidate[1] - candidate[0]))
+        evidence_cycles = range_counts[(first, last)]
+        expected = last - first + 1
+        if expected < 2 or evidence_cycles < 2:
+            return None
     results: list[CycleResult] = []
     for index, group in enumerate(groups, start=1):
         unique = set(group)

@@ -42,6 +42,13 @@ class SerialLogTests(unittest.TestCase):
         _, cycles = result
         self.assertTrue(cycles[1].included)
 
+    def test_manual_cycle_domain_allows_a_single_captured_sweep(self):
+        result = analyze_cycles([2, 3, 5, 6], expected_start=1, expected_count=6)
+        self.assertIsNotNone(result)
+        model, cycles = result
+        self.assertEqual((model.first_sequence, model.last_sequence, model.evidence_cycles), (1, 6, 0))
+        self.assertEqual(cycles[0].missing_values, (1, 4))
+
     def test_transaction_pairing_is_separate_from_receive_loss(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
         tx = RxChunk(b"\xFF\x01\x03", now, 1)
