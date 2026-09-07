@@ -34,6 +34,10 @@ class LossAnalyzerApp:
         self.header = StringVar(value="AA55")
         self.frame_size = StringVar(value="18")
         self.profile = StringVar(value="自定义固定帧")
+        self.length_offset = StringVar(value="2")
+        self.length_size = StringVar(value="1")
+        self.length_endian = StringVar(value="little")
+        self.length_adjust = StringVar(value="0")
         self.seq_offset = StringVar(value="2")
         self.seq_size = StringVar(value="2")
         self.endian = StringVar(value="little")
@@ -91,7 +95,11 @@ class LossAnalyzerApp:
         fields = [
             ("帧格式", self.profile, 16),
             ("帧头（HEX）", self.header, 12),
-            ("总帧长（字节）", self.frame_size, 10),
+            ("固定总帧长（固定帧用）", self.frame_size, 16),
+            ("长度字段偏移", self.length_offset, 12),
+            ("长度字段字节数", self.length_size, 12),
+            ("长度字段字节序", self.length_endian, 12),
+            ("长度字段调整值", self.length_adjust, 12),
             ("序号偏移", self.seq_offset, 10),
             ("序号字节数", self.seq_size, 8),
             ("字节序", self.endian, 9),
@@ -107,10 +115,10 @@ class LossAnalyzerApp:
             grid_column = column % 4
             ttk.Label(config, text=label).grid(row=row, column=grid_column, padx=4, sticky="w")
             if label == "帧格式":
-                widget = ttk.Combobox(config, textvariable=variable, values=("自定义固定帧", "Modbus RTU（CRC自动帧长）"), width=width, state="readonly")
-            elif label == "序号字节数":
+                widget = ttk.Combobox(config, textvariable=variable, values=("自定义固定帧", "自定义长度字段帧", "Modbus RTU（CRC自动帧长）"), width=width, state="readonly")
+            elif label in {"序号字节数", "长度字段字节数"}:
                 widget = ttk.Combobox(config, textvariable=variable, values=("1", "2", "4"), width=width, state="readonly")
-            elif label == "字节序":
+            elif label in {"字节序", "长度字段字节序"}:
                 widget = ttk.Combobox(config, textvariable=variable, values=("little", "big"), width=width, state="readonly")
             elif label == "CRC":
                 widget = ttk.Combobox(config, textvariable=variable, values=tuple(kind.value for kind in CrcKind), width=width, state="readonly")
@@ -119,6 +127,11 @@ class LossAnalyzerApp:
             widget.grid(row=row + 1, column=grid_column, padx=4, pady=(2, 8), sticky="ew")
         for column in range(4):
             config.columnconfigure(column, weight=1)
+        ttk.Label(
+            config,
+            text="长度字段帧规则：总帧长 = 指定偏移处的长度字段值 + 调整值；固定总帧长在该模式下不使用。",
+            style="Hint.TLabel",
+        ).grid(row=((len(fields) + 3) // 4) * 2, column=0, columnspan=4, padx=4, sticky="w")
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=12)
@@ -221,6 +234,8 @@ class LossAnalyzerApp:
     def profile_values(self) -> dict[str, str]:
         return {
             "profile": self.profile.get(), "header": self.header.get(), "frame_size": self.frame_size.get(),
+            "length_offset": self.length_offset.get(), "length_size": self.length_size.get(),
+            "length_endian": self.length_endian.get(), "length_adjust": self.length_adjust.get(),
             "seq_offset": self.seq_offset.get(), "seq_size": self.seq_size.get(), "endian": self.endian.get(),
             "max_gap": self.max_gap.get(), "crc": self.crc.get(), "cycle_coverage": self.cycle_coverage.get(),
             "transaction_timeout": self.transaction_timeout.get(), "manual_cycle_start": self.manual_cycle_start.get(),
@@ -253,6 +268,8 @@ class LossAnalyzerApp:
                 raise ValueError("不是本工具导出的协议方案。")
             for key, variable in (
                 ("profile", self.profile), ("header", self.header), ("frame_size", self.frame_size),
+                ("length_offset", self.length_offset), ("length_size", self.length_size),
+                ("length_endian", self.length_endian), ("length_adjust", self.length_adjust),
                 ("seq_offset", self.seq_offset), ("seq_size", self.seq_size), ("endian", self.endian),
                 ("max_gap", self.max_gap), ("crc", self.crc), ("cycle_coverage", self.cycle_coverage),
                 ("transaction_timeout", self.transaction_timeout), ("manual_cycle_start", self.manual_cycle_start),
@@ -388,16 +405,22 @@ class LossAnalyzerApp:
             if not path.is_file():
                 raise ValueError("请先拖入或选择日志文件。")
             is_modbus = self.profile.get().startswith("Modbus")
+            is_length_field = self.profile.get() == "自定义长度字段帧"
             header = b"" if is_modbus else parse_hex(self.header.get())
-            frame_size = None if is_modbus else int(self.frame_size.get())
+            frame_size = None if (is_modbus or is_length_field) else int(self.frame_size.get())
+            length_offset = int(self.length_offset.get()) if is_length_field else None
+            length_size = int(self.length_size.get()) if is_length_field else 1
+            length_adjust = int(self.length_adjust.get()) if is_length_field else 0
             seq_offset = int(self.seq_offset.get())
             seq_size = int(self.seq_size.get())
             max_gap = int(self.max_gap.get())
             coverage = float(self.cycle_coverage.get()) / 100
             self.transaction_timeout_value()
             manual_start, manual_count = self.manual_cycle_values()
-            if not is_modbus and frame_size <= len(header):
+            if not is_modbus and not is_length_field and frame_size <= len(header):
                 raise ValueError("总帧长必须大于帧头长度。")
+            if is_length_field and (length_offset is None or length_offset < 0 or length_size not in (1, 2, 4)):
+                raise ValueError("请填写有效的长度字段偏移和字节数（1、2 或 4）。")
             if seq_offset < 0 or (frame_size is not None and seq_offset + seq_size > frame_size):
                 raise ValueError("序号字段超出帧范围。")
             if max_gap < 0:
@@ -418,7 +441,11 @@ class LossAnalyzerApp:
             config = (
                 FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS, max_frame_gap_ms=max_gap or None)
                 if is_modbus
-                else FrameConfig(header, fixed_length=frame_size, crc=CrcKind(self.crc.get()), max_frame_gap_ms=max_gap or None)
+                else FrameConfig(
+                    header, fixed_length=frame_size, length_offset=length_offset, length_size=length_size,
+                    length_endian=self.length_endian.get(), length_adjust=length_adjust,
+                    crc=CrcKind(self.crc.get()), max_frame_gap_ms=max_gap or None,
+                )
             )
             parsed = parse_chunks(self.input_chunks, config)
             captured = parsed.frames

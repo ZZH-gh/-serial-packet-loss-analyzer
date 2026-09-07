@@ -51,6 +51,16 @@ class FrameParserTests(unittest.TestCase):
         self.assertEqual(result.frames, [frame])
         self.assertEqual(result.crc_errors, 0)
 
+    def test_custom_length_field_template_uses_offset_endian_and_adjustment(self):
+        # Header AA55, byte at offset 2 says payload is 3 B, so full frame is
+        # 3 + (2 B header + 1 B length field) = 6 B.
+        frame = b"\xAA\x55\x03\x10\x20\x30"
+        result = parse_chunks(
+            [RxChunk(frame[:4]), RxChunk(frame[4:])],
+            FrameConfig(b"\xAA\x55", length_offset=2, length_size=1, length_endian="little", length_adjust=3),
+        )
+        self.assertEqual(result.frames, [frame])
+
 
 if __name__ == "__main__":
     unittest.main()
