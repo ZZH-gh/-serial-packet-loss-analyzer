@@ -6,10 +6,10 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from frame_parser import RxChunk
+from frame_parser import FrameConfig, FrameEvidence, RxChunk
 from serial_loss_analyzer import (
-    DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles,
-    match_transactions, read_directional_chunks,
+    DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
+    analyze_log, match_transactions, read_directional_chunks,
 )
 
 
@@ -69,6 +69,38 @@ class SerialLogTests(unittest.TestCase):
         read = DirectionRead(rx_chunks=[rx], tx_chunks=[tx], records=[LoggedChunk("tx", tx), LoggedChunk("rx", rx)])
         result = match_transactions(read, timeout_ms=30)
         self.assertEqual((result.paired, result.timed_out_sent, result.orphan_received), (0, 1, 1))
+
+    def test_time_windows_locate_missing_sequence_and_long_interval(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        evidence = [
+            FrameEvidence(b"a", first_timestamp=now),
+            FrameEvidence(b"b", first_timestamp=now + timedelta(milliseconds=100)),
+            FrameEvidence(b"c", first_timestamp=now + timedelta(milliseconds=200)),
+            FrameEvidence(b"d", first_timestamp=now + timedelta(milliseconds=1000)),
+        ]
+        baseline, windows = analyze_time_windows(evidence, [1, 2, 4, 5], 1, 1000, 60)
+        self.assertEqual(baseline, 100.0)
+        self.assertEqual((windows[0].received, windows[0].missing, windows[0].long_intervals), (4, 1, 1))
+
+    def test_time_windows_allow_hour_long_buckets(self):
+        now = datetime(1900, 1, 1, 12, 34, 1)
+        evidence = [
+            FrameEvidence(b"a", first_timestamp=now),
+            FrameEvidence(b"b", first_timestamp=now + timedelta(seconds=1)),
+        ]
+        _, windows = analyze_time_windows(evidence, [1, 2], 1, 10, 3600)
+        self.assertEqual(windows[0].start.strftime("%H:%M:%S"), "12:00:00")
+
+    def test_analyze_log_reuses_rx_only_pipeline_for_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "compare.dat"
+            path.write_bytes(
+                b"[12:00:00.000]" + SSCOM_RX_LABEL + b"AA 55 01\r\n"
+                + b"[12:00:00.100]" + SSCOM_RX_LABEL + b"AA 55 03\r\n"
+            )
+            result = analyze_log(path, FrameConfig(b"\xAA\x55", fixed_length=3), 2, 1, "little", 10)
+        self.assertEqual(result.sequences, [1, 3])
+        self.assertEqual((result.missing, result.loss_percent), (1, 100 / 3))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import statistics
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -107,6 +108,143 @@ class TransactionSummary:
     @property
     def average_latency_ms(self) -> float | None:
         return sum(self.latency_ms) / len(self.latency_ms) if self.latency_ms else None
+
+
+@dataclass(frozen=True)
+class TimeWindowResult:
+    start: datetime
+    received: int
+    missing: int
+    average_interval_ms: float | None
+    max_interval_ms: float | None
+    long_intervals: int
+
+    @property
+    def loss_percent(self) -> float:
+        total = self.received + self.missing
+        return 100 * self.missing / total if total else 0.0
+
+
+@dataclass
+class LogAnalysis:
+    path: Path
+    direction_read: DirectionRead
+    parsed: object
+    sequences: list[int]
+    cycle_model: CycleModel | None
+    cycle_results: list[CycleResult]
+    gaps: list[Gap]
+    duplicates: int
+    resets: int
+    missing: int
+    loss_percent: float
+
+    @property
+    def mode(self) -> str:
+        return "cycle" if self.cycle_model else "continuous"
+
+
+def analyze_time_windows(
+    evidence: list, sequences: list[int], sequence_size: int, max_sequence_gap: int,
+    window_seconds: int = 60,
+) -> tuple[float | None, list[TimeWindowResult]]:
+    """Group valid RX frames by time and locate sequence gaps / long pauses.
+
+    Only recorded timestamps participate.  Missing sequence numbers are charged
+    to the later frame's bucket, making the evidence table and time table agree.
+    """
+    timestamped = [(item, value) for item, value in zip(evidence, sequences) if item.first_timestamp]
+    if len(timestamped) < 2:
+        return None, []
+    intervals = [
+        (right[0].first_timestamp - left[0].first_timestamp).total_seconds() * 1000
+        for left, right in zip(timestamped, timestamped[1:])
+        if (right[0].first_timestamp - left[0].first_timestamp).total_seconds() >= 0
+    ]
+    baseline = statistics.median(intervals) if intervals else None
+    long_limit = baseline * 3 if baseline and baseline > 0 else None
+    buckets: dict[datetime, dict] = {}
+
+    def bucket_at(timestamp: datetime) -> dict:
+        # Do not use ``datetime.replace(second=...)`` here: a user may choose
+        # 60 seconds or more, and the resulting second field would be invalid.
+        # Bucket relative to midnight instead, so every value from 1 to 3600 s
+        # has a stable, displayable start time.
+        seconds_since_midnight = timestamp.hour * 3600 + timestamp.minute * 60 + timestamp.second
+        bucket_seconds = (seconds_since_midnight // window_seconds) * window_seconds
+        start = timestamp.replace(
+            hour=bucket_seconds // 3600,
+            minute=(bucket_seconds % 3600) // 60,
+            second=bucket_seconds % 60,
+            microsecond=0,
+        )
+        return buckets.setdefault(start, {"received": 0, "missing": 0, "intervals": [], "long": 0})
+
+    modulus = 1 << (8 * sequence_size)
+    previous_item = previous_value = None
+    for item, value in timestamped:
+        bucket = bucket_at(item.first_timestamp)
+        bucket["received"] += 1
+        if previous_item is not None:
+            interval = (item.first_timestamp - previous_item.first_timestamp).total_seconds() * 1000
+            if interval >= 0:
+                bucket["intervals"].append(interval)
+                if long_limit is not None and interval > long_limit:
+                    bucket["long"] += 1
+            advance = (value - previous_value) % modulus
+            if 2 <= advance <= max_sequence_gap + 1:
+                bucket["missing"] += advance - 1
+        previous_item, previous_value = item, value
+    results = [
+        TimeWindowResult(
+            start, data["received"], data["missing"],
+            statistics.mean(data["intervals"]) if data["intervals"] else None,
+            max(data["intervals"]) if data["intervals"] else None, data["long"],
+        )
+        for start, data in sorted(buckets.items())
+    ]
+    return baseline, results
+
+
+def analyze_log(
+    path: Path, frame_config, sequence_offset: int, sequence_size: int, endian: str,
+    max_sequence_gap: int, min_coverage: float = 0.5,
+    expected_start: int | None = None, expected_count: int | None = None,
+) -> LogAnalysis:
+    """Run the same RX-only analysis used by the GUI, for batch comparison."""
+    from frame_parser import parse_chunks
+
+    direction_read = read_directional_chunks(path)
+    chunks = direction_read.rx_chunks if direction_read.direction_markers_found else direction_read.unknown_chunks
+    parsed = parse_chunks(chunks, frame_config)
+    sequences = [int.from_bytes(frame[sequence_offset : sequence_offset + sequence_size], endian) for frame in parsed.frames]
+    if not sequences:
+        raise ValueError("没有找到完整帧")
+    cyclic = analyze_cycles(sequences, min_coverage, expected_start, expected_count)
+    if cyclic:
+        model, cycles = cyclic
+        included = [cycle for cycle in cycles if cycle.included]
+        missing = sum(cycle.missing for cycle in included)
+        received = sum(cycle.received for cycle in included)
+        rate = 100 * missing / (received + missing) if received + missing else 0.0
+        return LogAnalysis(path, direction_read, parsed, sequences, model, cycles, [], 0, 0, missing, rate)
+
+    modulus = 1 << (8 * sequence_size)
+    gaps: list[Gap] = []
+    duplicates = resets = 0
+    for previous, current in zip(sequences, sequences[1:]):
+        advance = (current - previous) % modulus
+        if advance == 0:
+            duplicates += 1
+        elif advance == 1:
+            continue
+        elif advance - 1 <= max_sequence_gap:
+            gaps.append(Gap(previous, (previous + 1) % modulus, (current - 1) % modulus, advance - 1))
+        else:
+            resets += 1
+    missing = sum(gap.count for gap in gaps)
+    rate = 100 * missing / (len(sequences) + missing) if sequences else 0.0
+    return LogAnalysis(path, direction_read, parsed, sequences, None, [], gaps, duplicates, resets, missing, rate)
 
 
 def parse_hex(value: str) -> bytes:

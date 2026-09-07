@@ -12,15 +12,60 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, Toplevel, filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from frame_parser import CrcKind, FrameConfig, FrameProtocol, parse_chunks
 from serial_loss_analyzer import (
-    CycleResult, Gap, analyze_cycles, detect_modbus_rtu, detect_protocol,
-    detect_sequence_field, match_transactions, parse_hex, read_directional_chunks,
+    CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, detect_modbus_rtu,
+    detect_protocol, detect_sequence_field, match_transactions, parse_hex, read_directional_chunks,
 )
+
+
+PARAMETER_HELP = {
+    "帧格式": "选择帧切分规则。Modbus 自动验证 CRC；私有协议可选固定帧或长度字段帧。",
+    "帧头（HEX）": "每帧开头的固定字节，例如 AA55。长度字段帧与固定帧均用它重新同步。",
+    "固定总帧长（固定帧用）": "固定帧模式下，一整帧从帧头到 CRC 的总字节数。",
+    "长度字段偏移": "长度字段相对于帧头的字节位置；帧头第一个字节偏移为 0。",
+    "长度字段字节数": "长度字段占用 1、2 或 4 字节。",
+    "长度字段字节序": "多字节长度字段的排列方式；常见 MCU 协议多为 little，网络协议常为 big。",
+    "长度字段调整值": "总帧长 = 长度字段值 + 调整值。例如 2 字节帧头 + 1 字节长度 + N 数据，调整值填 3。",
+    "序号偏移": "递增序号相对于帧头的字节位置。证据页会显示每帧提取出的值，便于核对。",
+    "序号字节数": "序号字段占用 1、2 或 4 字节。",
+    "字节序": "多字节序号的排列方式。",
+    "帧内超时(ms,0关闭)": "一帧尚未收全时，下一次接收相隔超过该值，前面的残留会记为截断。",
+    "CRC": "选择帧尾校验规则。CRC 不通过的内容不会作为有效帧参与丢包统计。",
+    "循环纳入阈值(%)": "某轮收到的唯一序号少于理论帧数的该比例时，标为采集冗余，不纳入过滤后平均。全部循环结果仍会显示。",
+    "收发超时(ms,0关闭)": "TX 后在该时间内没有 RX，记为未响应。只影响收发健康度，不影响 RX 丢包率。",
+    "手动循环起始序号": "已知协议循环范围时填写起点；需与手动理论帧数同时填写。",
+    "手动理论帧数": "已知一个循环中应有多少序号时填写；会覆盖自动循环范围推断。",
+    "时间统计窗口(s)": "按多少秒汇总有效 RX 帧、缺号和帧间隔；默认 60 秒。",
+}
+
+
+class Tooltip:
+    """Small, keyboard-free parameter explanation popup."""
+
+    def __init__(self, widget, text: str) -> None:
+        self.widget, self.text, self.popup = widget, text, None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+
+    def show(self, _event=None) -> None:
+        if self.popup:
+            return
+        self.popup = Toplevel(self.widget)
+        self.popup.wm_overrideredirect(True)
+        self.popup.attributes("-topmost", True)
+        label = ttk.Label(self.popup, text=self.text, justify="left", wraplength=330, style="Tooltip.TLabel", padding=8)
+        label.pack()
+        self.popup.geometry(f"+{self.widget.winfo_rootx() + 18}+{self.widget.winfo_rooty() + 20}")
+
+    def hide(self, _event=None) -> None:
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
 
 
 class LossAnalyzerApp:
@@ -48,8 +93,9 @@ class LossAnalyzerApp:
         self.transaction_timeout = StringVar(value="1500")
         self.manual_cycle_start = StringVar(value="")
         self.manual_cycle_count = StringVar(value="")
+        self.time_window_seconds = StringVar(value="60")
         self.crc = StringVar(value=CrcKind.NONE.value)
-        self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV 文件，或点击“选择日志文件”。")
+        self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV/DAT 文件，或点击“选择日志文件”。")
         self.gaps: list[Gap] = []
         self.cycle_results: list[CycleResult] = []
         self.cyclic_mode = False
@@ -60,6 +106,8 @@ class LossAnalyzerApp:
         self.transaction_note = ""
         self.evidence_rows: list[dict[str, str]] = []
         self.last_report: dict | None = None
+        self.compare_paths: list[Path] = []
+        self.comparison_rows: list[dict[str, str]] = []
         self._build()
 
     def _build(self) -> None:
@@ -72,6 +120,8 @@ class LossAnalyzerApp:
         style.configure("HeaderMeta.TLabel", background="#102A43", foreground="#A9C3D7", font=("Microsoft YaHei UI", 9))
         style.configure("Section.TLabel", background="#EAF1F5", foreground="#0B7189", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Hint.TLabel", background="#EAF1F5", foreground="#62778A", font=("Microsoft YaHei UI", 8))
+        style.configure("Help.TLabel", background="#EAF1F5", foreground="#007C91", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Tooltip.TLabel", background="#102A43", foreground="#FFFFFF", relief="solid", borderwidth=1, font=("Microsoft YaHei UI", 9))
         style.configure("Drop.TLabel", background="#F9FCFD", foreground="#26526B", font=("Microsoft YaHei UI", 11, "bold"), relief="solid", borderwidth=1)
         style.configure("TLabelframe", background="#EAF1F5", bordercolor="#C4D5DF", relief="solid")
         style.configure("TLabelframe.Label", background="#EAF1F5", foreground="#1D536C", font=("Microsoft YaHei UI", 9, "bold"))
@@ -142,6 +192,7 @@ class LossAnalyzerApp:
         file_row = ttk.Frame(outer, style="App.TFrame")
         file_row.pack(fill="x", pady=(10, 16))
         ttk.Entry(file_row, textvariable=self.file_path, state="readonly").pack(side=LEFT, fill="x", expand=True)
+        ttk.Button(file_row, text="选择多份对比", command=self.choose_compare_files, style="Secondary.TButton").pack(side=RIGHT, padx=(6, 0))
         ttk.Button(file_row, text="选择日志文件", command=self.choose_file, style="Secondary.TButton").pack(side=RIGHT, padx=(10, 0))
 
         ttk.Label(outer, text="02  校验规则", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
@@ -164,11 +215,18 @@ class LossAnalyzerApp:
             ("收发超时(ms,0关闭)", self.transaction_timeout, 14),
             ("手动循环起始序号", self.manual_cycle_start, 14),
             ("手动理论帧数", self.manual_cycle_count, 14),
+            ("时间统计窗口(s)", self.time_window_seconds, 14),
         ]
         for column, (label, variable, width) in enumerate(fields):
             row = (column // 4) * 2
             grid_column = column % 4
-            ttk.Label(config, text=label).grid(row=row, column=grid_column, padx=4, sticky="w")
+            label_row = ttk.Frame(config, style="App.TFrame")
+            label_row.grid(row=row, column=grid_column, padx=4, sticky="w")
+            ttk.Label(label_row, text=label).pack(side=LEFT)
+            if label in PARAMETER_HELP:
+                help_mark = ttk.Label(label_row, text="  ?", style="Help.TLabel", cursor="question_arrow")
+                help_mark.pack(side=LEFT)
+                Tooltip(help_mark, PARAMETER_HELP[label])
             if label == "帧格式":
                 widget = ttk.Combobox(config, textvariable=variable, values=("自定义固定帧", "自定义长度字段帧", "Modbus RTU（CRC自动帧长）"), width=width, state="readonly")
             elif label in {"序号字节数", "长度字段字节数"}:
@@ -200,15 +258,21 @@ class LossAnalyzerApp:
         self.evidence_export_button.pack(side=LEFT, padx=(4, 0))
         self.report_export_button = ttk.Button(buttons, text="导出报告 JSON", command=self.export_report, state="disabled", style="Export.TButton")
         self.report_export_button.pack(side=LEFT, padx=(4, 0))
+        self.comparison_export_button = ttk.Button(buttons, text="导出对比 CSV", command=self.export_comparison, state="disabled", style="Export.TButton")
+        self.comparison_export_button.pack(side=LEFT, padx=(4, 0))
 
         ttk.Label(outer, text="03  分析结果", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel").pack(fill="x", pady=(0, 10))
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill=BOTH, expand=True)
-        table_frame = ttk.Frame(notebook)
-        evidence_frame = ttk.Frame(notebook)
-        notebook.add(table_frame, text="统计明细")
-        notebook.add(evidence_frame, text="解析证据")
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill=BOTH, expand=True)
+        table_frame = ttk.Frame(self.notebook)
+        evidence_frame = ttk.Frame(self.notebook)
+        time_frame = ttk.Frame(self.notebook)
+        comparison_frame = ttk.Frame(self.notebook)
+        self.notebook.add(table_frame, text="统计明细")
+        self.notebook.add(evidence_frame, text="解析证据")
+        self.notebook.add(time_frame, text="时间定位")
+        self.notebook.add(comparison_frame, text="多文件对比")
         self.table = ttk.Treeview(
             table_frame,
             columns=("after", "first", "last", "count"),
@@ -236,6 +300,31 @@ class LossAnalyzerApp:
         self.evidence.configure(yscrollcommand=evidence_scroll.set)
         self.evidence.pack(side=LEFT, fill=BOTH, expand=True)
         evidence_scroll.pack(side=RIGHT, fill="y")
+
+        self.time_table = ttk.Treeview(time_frame, columns=("time", "frames", "missing", "loss", "avg", "max", "long"), show="headings", height=10)
+        for key, text, width in (
+            ("time", "时间段", 150), ("frames", "有效帧", 95), ("missing", "缺失帧", 95),
+            ("loss", "丢包率", 95), ("avg", "平均间隔", 110), ("max", "最大间隔", 110), ("long", "异常长间隔", 110),
+        ):
+            self.time_table.heading(key, text=text)
+            self.time_table.column(key, width=width, anchor="center", stretch=True)
+        time_scroll = ttk.Scrollbar(time_frame, orient="vertical", command=self.time_table.yview)
+        self.time_table.configure(yscrollcommand=time_scroll.set)
+        self.time_table.pack(side=LEFT, fill=BOTH, expand=True)
+        time_scroll.pack(side=RIGHT, fill="y")
+
+        self.comparison_table = ttk.Treeview(comparison_frame, columns=("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result"), show="headings", height=10)
+        for key, text, width in (
+            ("file", "日志文件", 240), ("mode", "统计模式", 90), ("frames", "完整帧", 80),
+            ("loss", "丢包率", 85), ("missing", "缺失帧", 85), ("crc", "CRC错误", 85),
+            ("truncated", "截断", 70), ("direction", "RX/TX", 100), ("result", "结果", 190),
+        ):
+            self.comparison_table.heading(key, text=text)
+            self.comparison_table.column(key, width=width, anchor="center", stretch=key in {"file", "result"})
+        comparison_scroll = ttk.Scrollbar(comparison_frame, orient="vertical", command=self.comparison_table.yview)
+        self.comparison_table.configure(yscrollcommand=comparison_scroll.set)
+        self.comparison_table.pack(side=LEFT, fill=BOTH, expand=True)
+        comparison_scroll.pack(side=RIGHT, fill="y")
 
     def set_table_headings(self, headings) -> None:
         for key, text in headings:
@@ -287,6 +376,42 @@ class LossAnalyzerApp:
             self.evidence_rows.append(row)
             self.evidence.insert("", END, values=(row["frame"], row["lines"], row["time"], row["bytes"], row["sequence"], row["status"]))
 
+    def populate_time_windows(self, parsed, sequences: list[int], sequence_size: int, max_gap: int, window_seconds: int) -> tuple[float | None, list]:
+        self.time_table.delete(*self.time_table.get_children())
+        baseline, windows = analyze_time_windows(parsed.frame_evidence, sequences, sequence_size, max_gap, window_seconds)
+        for window in windows:
+            average = f"{window.average_interval_ms:.1f} ms" if window.average_interval_ms is not None else "—"
+            maximum = f"{window.max_interval_ms:.1f} ms" if window.max_interval_ms is not None else "—"
+            self.time_table.insert(
+                "", END,
+                values=(window.start.strftime("%H:%M:%S"), window.received, window.missing, f"{window.loss_percent:.2f}%", average, maximum, window.long_intervals),
+            )
+        return baseline, windows
+
+    def populate_comparisons(self, config, seq_offset: int, seq_size: int, endian: str, max_gap: int, coverage: float, manual_start: int | None, manual_count: int | None) -> None:
+        self.comparison_table.delete(*self.comparison_table.get_children())
+        self.comparison_rows = []
+        for path in self.compare_paths:
+            try:
+                analysis = analyze_log(path, config, seq_offset, seq_size, endian, max_gap, coverage, manual_start, manual_count)
+                direction = analysis.direction_read
+                direction_text = f"{len(direction.rx_chunks)}/{len(direction.tx_chunks)}" if direction.direction_markers_found else "方向未知"
+                result = (
+                    f"循环 {analysis.cycle_model.first_sequence}..{analysis.cycle_model.last_sequence}"
+                    if analysis.cycle_model else f"重复 {analysis.duplicates}；异常跳变 {analysis.resets}"
+                )
+                row = {
+                    "file": path.name, "mode": "循环" if analysis.cycle_model else "连续", "frames": str(len(analysis.sequences)),
+                    "loss": f"{analysis.loss_percent:.4f}%", "missing": str(analysis.missing),
+                    "crc": str(analysis.parsed.crc_errors), "truncated": str(analysis.parsed.truncations),
+                    "direction": direction_text, "result": result,
+                }
+            except (OSError, ValueError) as error:
+                row = {"file": path.name, "mode": "—", "frames": "—", "loss": "—", "missing": "—", "crc": "—", "truncated": "—", "direction": "—", "result": f"无法分析：{error}"}
+            self.comparison_rows.append(row)
+            self.comparison_table.insert("", END, values=tuple(row[key] for key in ("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result")))
+        self.comparison_export_button.configure(state="normal" if self.comparison_rows else "disabled")
+
     def profile_values(self) -> dict[str, str]:
         return {
             "profile": self.profile.get(), "header": self.header.get(), "frame_size": self.frame_size.get(),
@@ -295,7 +420,7 @@ class LossAnalyzerApp:
             "seq_offset": self.seq_offset.get(), "seq_size": self.seq_size.get(), "endian": self.endian.get(),
             "max_gap": self.max_gap.get(), "crc": self.crc.get(), "cycle_coverage": self.cycle_coverage.get(),
             "transaction_timeout": self.transaction_timeout.get(), "manual_cycle_start": self.manual_cycle_start.get(),
-            "manual_cycle_count": self.manual_cycle_count.get(),
+            "manual_cycle_count": self.manual_cycle_count.get(), "time_window_seconds": self.time_window_seconds.get(),
         }
 
     def save_profile(self) -> None:
@@ -329,7 +454,7 @@ class LossAnalyzerApp:
                 ("seq_offset", self.seq_offset), ("seq_size", self.seq_size), ("endian", self.endian),
                 ("max_gap", self.max_gap), ("crc", self.crc), ("cycle_coverage", self.cycle_coverage),
                 ("transaction_timeout", self.transaction_timeout), ("manual_cycle_start", self.manual_cycle_start),
-                ("manual_cycle_count", self.manual_cycle_count),
+                ("manual_cycle_count", self.manual_cycle_count), ("time_window_seconds", self.time_window_seconds),
             ):
                 if key in values:
                     variable.set(str(values[key]))
@@ -362,16 +487,34 @@ class LossAnalyzerApp:
         if filename:
             self.load_file(Path(filename))
 
+    def choose_compare_files(self) -> None:
+        filenames = filedialog.askopenfilenames(
+            title="选择同一协议的多份日志",
+            filetypes=(("日志文件", "*.txt *.csv *.dat"), ("所有文件", "*.*")),
+        )
+        if filenames:
+            self.load_files([Path(filename) for filename in filenames])
+
     def on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            self.load_file(Path(paths[0]))
+            self.load_files([Path(path) for path in paths])
 
-    def load_file(self, path: Path) -> None:
+    def load_files(self, paths: list[Path]) -> None:
+        valid = [path for path in paths if path.suffix.lower() in {".txt", ".csv", ".dat"}]
+        if not valid:
+            messagebox.showerror("文件类型不支持", "请选择 TXT、CSV 或 DAT 日志文件。")
+            return
+        self.load_file(valid[0], comparison_paths=valid)
+        if len(valid) > 1:
+            self.result.set(self.result.get() + f"\n已加入 {len(valid)} 份同协议日志；点击“开始统计”后在“多文件对比”页查看横向结果。")
+
+    def load_file(self, path: Path, comparison_paths: list[Path] | None = None) -> None:
         if path.suffix.lower() not in {".txt", ".csv", ".dat"}:
             messagebox.showerror("文件类型不支持", "请选择 TXT、CSV 或 DAT 日志文件。")
             return
         self.file_path.set(str(path))
+        self.compare_paths = comparison_paths or [path]
         self.gaps = []
         self.cycle_results = []
         self.cyclic_mode = False
@@ -380,11 +523,15 @@ class LossAnalyzerApp:
         self.direction_read = None
         self.table.delete(*self.table.get_children())
         self.evidence.delete(*self.evidence.get_children())
+        self.time_table.delete(*self.time_table.get_children())
+        self.comparison_table.delete(*self.comparison_table.get_children())
         self.evidence_rows = []
+        self.comparison_rows = []
         self.last_report = None
         self.export_button.configure(state="disabled")
         self.evidence_export_button.configure(state="disabled")
         self.report_export_button.configure(state="disabled")
+        self.comparison_export_button.configure(state="disabled")
         self.auto_detect(silent=True)
 
     def auto_detect(self, silent: bool = False) -> None:
@@ -470,6 +617,7 @@ class LossAnalyzerApp:
             seq_offset = int(self.seq_offset.get())
             seq_size = int(self.seq_size.get())
             max_gap = int(self.max_gap.get())
+            time_window = int(self.time_window_seconds.get())
             coverage = float(self.cycle_coverage.get()) / 100
             self.transaction_timeout_value()
             manual_start, manual_count = self.manual_cycle_values()
@@ -481,6 +629,8 @@ class LossAnalyzerApp:
                 raise ValueError("序号字段超出帧范围。")
             if max_gap < 0:
                 raise ValueError("帧内超时不能小于 0。")
+            if time_window < 1 or time_window > 3600:
+                raise ValueError("时间统计窗口必须在 1 到 3600 秒之间。")
             if not 0 < coverage <= 1:
                 raise ValueError("循环纳入阈值必须在 0 到 100 之间。")
             if not self.input_chunks:
@@ -578,6 +728,14 @@ class LossAnalyzerApp:
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}\n{self.transaction_note}"
             )
         self.populate_evidence(parsed, sequences)
+        interval_baseline, time_windows = self.populate_time_windows(parsed, sequences, seq_size, max_gap, time_window)
+        self.populate_comparisons(config, seq_offset, seq_size, self.endian.get(), max_gap, coverage, manual_start, manual_count)
+        if time_windows:
+            worst = max(time_windows, key=lambda item: (item.loss_percent, item.long_intervals, item.max_interval_ms or 0))
+            baseline_text = f"基准帧间隔 {interval_baseline:.1f} ms" if interval_baseline is not None else "基准帧间隔不足"
+            self.result.set(self.result.get() + f"\n时间定位：{baseline_text}；最需关注 {worst.start.strftime('%H:%M:%S')}，丢包 {worst.loss_percent:.2f}%，异常长间隔 {worst.long_intervals} 次。")
+        else:
+            self.result.set(self.result.get() + "\n时间定位：日志缺少可用时间戳，无法按时间段统计。")
         transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read else None
         file_bytes = path.read_bytes()
         self.last_report = {
@@ -597,6 +755,14 @@ class LossAnalyzerApp:
                 "events": [{"kind": event.kind, "received": event.received, "expected": event.expected, "detail": event.detail} for event in parsed.events],
             },
             "statistics": analysis_stats,
+            "time_statistics": {
+                "window_seconds": time_window, "baseline_interval_ms": interval_baseline,
+                "windows": [{
+                    "start": item.start.isoformat(), "received": item.received, "missing": item.missing,
+                    "loss_percent": item.loss_percent, "average_interval_ms": item.average_interval_ms,
+                    "max_interval_ms": item.max_interval_ms, "long_intervals": item.long_intervals,
+                } for item in time_windows],
+            },
             "transactions": None if transaction is None else {
                 "sent": transaction.sent, "received": transaction.received, "paired": transaction.paired,
                 "unmatched_sent": transaction.unmatched_sent, "timed_out_sent": transaction.timed_out_sent,
@@ -604,6 +770,7 @@ class LossAnalyzerApp:
                 "average_latency_ms": transaction.average_latency_ms,
             },
             "evidence_csv_columns": ["frame", "lines", "time", "bytes", "sequence", "status"],
+            "comparisons": self.comparison_rows,
         }
         self.export_button.configure(state="normal")
         self.evidence_export_button.configure(state="normal")
@@ -646,6 +813,23 @@ class LossAnalyzerApp:
             writer = csv.DictWriter(output, fieldnames=("frame", "lines", "time", "bytes", "sequence", "status"))
             writer.writeheader()
             writer.writerows(self.evidence_rows)
+        messagebox.showinfo("导出完成", f"已保存：\n{filename}")
+
+    def export_comparison(self) -> None:
+        if not self.comparison_rows:
+            messagebox.showwarning("暂无对比", "请先拖入一份或多份日志并完成统计。")
+            return
+        filename = filedialog.asksaveasfilename(
+            title="保存多文件对比", defaultextension=".csv", initialfile="serial-log-comparison.csv",
+            filetypes=(("CSV 文件", "*.csv"),),
+        )
+        if not filename:
+            return
+        fields = ("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result")
+        with Path(filename).open("w", newline="", encoding="utf-8-sig") as output:
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(self.comparison_rows)
         messagebox.showinfo("导出完成", f"已保存：\n{filename}")
 
     def export_report(self) -> None:
