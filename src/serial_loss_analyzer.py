@@ -99,6 +99,7 @@ class TransactionSummary:
     received: int
     paired: int
     unmatched_sent: int
+    timed_out_sent: int
     orphan_received: int
     key_confirmed: int
     latency_ms: tuple[float, ...]
@@ -297,7 +298,7 @@ def detect_sequence_field(captured: list[bytes]) -> tuple[int, int, str] | None:
     return best[1], best[2], best[3]
 
 
-def analyze_cycles(sequences: list[int]) -> tuple[CycleModel, list[CycleResult]] | None:
+def analyze_cycles(sequences: list[int], min_coverage: float = 0.5) -> tuple[CycleModel, list[CycleResult]] | None:
     """Analyze ascending sweeps without turning partial logs into a tiny cycle.
 
     A decrease is a *candidate* boundary.  The sequence domain is accepted
@@ -305,6 +306,8 @@ def analyze_cycles(sequences: list[int]) -> tuple[CycleModel, list[CycleResult]]
     range.  This fixes the common failure mode where several short fragments
     make a span of 5 look more frequent than the real 1..86 cycle.
     """
+    if not 0 < min_coverage <= 1:
+        raise ValueError("min_coverage must be in (0, 1]")
     if len(sequences) < 6:
         return None
     groups: list[list[int]] = [[]]
@@ -339,7 +342,7 @@ def analyze_cycles(sequences: list[int]) -> tuple[CycleModel, list[CycleResult]]
         received = len(present)
         results.append(
             CycleResult(
-                index, received, expected, len(missing_values), received * 2 >= expected,
+                index, received, expected, len(missing_values), received >= expected * min_coverage,
                 min(group), max(group), len(group) - len(unique), missing_values,
             )
         )
@@ -360,15 +363,21 @@ def detect_modbus_rtu(chunks: list) -> tuple[list[bytes], object] | None:
     return parsed.frames, parsed
 
 
-def match_transactions(direction_read: DirectionRead) -> TransactionSummary:
+def match_transactions(direction_read: DirectionRead, timeout_ms: int | None = 1500) -> TransactionSummary:
     """Pair each TX with the next RX; never use this for RX loss statistics."""
     waiting = []
-    paired = orphan = key_confirmed = 0
+    paired = orphan = key_confirmed = timed_out = 0
     latencies: list[float] = []
     for record in direction_read.records:
         if record.direction == "tx":
             waiting.append(record.chunk)
         elif record.direction == "rx":
+            while (
+                waiting and timeout_ms is not None and waiting[0].timestamp and record.chunk.timestamp
+                and (record.chunk.timestamp - waiting[0].timestamp).total_seconds() * 1000 > timeout_ms
+            ):
+                waiting.pop(0)
+                timed_out += 1
             if not waiting:
                 orphan += 1
                 continue
@@ -385,7 +394,7 @@ def match_transactions(direction_read: DirectionRead) -> TransactionSummary:
                     latencies.append(elapsed)
     return TransactionSummary(
         len(direction_read.tx_chunks), len(direction_read.rx_chunks), paired,
-        len(waiting), orphan, key_confirmed, tuple(latencies),
+        len(waiting) + timed_out, timed_out, orphan, key_confirmed, tuple(latencies),
     )
 
 

@@ -77,9 +77,21 @@ class ParseEvent:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class FrameEvidence:
+    """Where an emitted frame came from in the original serial log."""
+
+    frame: bytes
+    first_line_no: int = 0
+    last_line_no: int = 0
+    first_timestamp: datetime | None = None
+    last_timestamp: datetime | None = None
+
+
 @dataclass
 class ParseResult:
     frames: list[bytes] = field(default_factory=list)
+    frame_evidence: list[FrameEvidence] = field(default_factory=list)
     events: list[ParseEvent] = field(default_factory=list)
     noise_bytes: int = 0
 
@@ -124,6 +136,11 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
     if config.protocol is FrameProtocol.CUSTOM and not config.header:
         raise ValueError("header must not be empty")
     result, buffer, pending_at = ParseResult(), bytearray(), None
+    origins: list[tuple[int, datetime | None]] = []
+
+    def discard(count: int) -> None:
+        del buffer[:count]
+        del origins[:count]
 
     def classify_incomplete(reason: str) -> None:
         nonlocal pending_at
@@ -131,6 +148,7 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
         if config.protocol is FrameProtocol.MODBUS_RTU or buffer.startswith(config.header):
             result.events.append(ParseEvent("truncated", len(buffer), expected, reason))
         buffer.clear()
+        origins.clear()
         pending_at = None
 
     def consume() -> None:
@@ -150,7 +168,7 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
                     if dropped:
                         result.noise_bytes += dropped
                         result.events.append(ParseEvent("noise", dropped, detail="bytes before Modbus function"))
-                        del buffer[:dropped]
+                    discard(dropped)
                     return
             else:
                 start = buffer.find(config.header)
@@ -161,19 +179,19 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
                     if dropped:
                         result.noise_bytes += dropped
                         result.events.append(ParseEvent("noise", dropped, detail="bytes before frame header"))
-                        del buffer[:dropped]
+                        discard(dropped)
                     return
             if start:
                 result.noise_bytes += start
                 result.events.append(ParseEvent("noise", start, detail="bytes before frame header"))
-                del buffer[:start]
+                discard(start)
             expected = config.frame_length(buffer)
             if expected is None:
                 return
             minimum = 3 if config.protocol is FrameProtocol.MODBUS_RTU else len(config.header) + (2 if config.crc is not CrcKind.NONE else 0)
             if expected < minimum:
                 result.events.append(ParseEvent("invalid_length", len(buffer), expected))
-                del buffer[0]
+                discard(1)
                 continue
             if len(buffer) < expected:
                 # For arbitrary-address Modbus frames a payload byte can look
@@ -182,17 +200,20 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
                 later = -1 if config.protocol is FrameProtocol.MODBUS_RTU else buffer.find(config.header, 1)
                 if later > 0:
                     result.events.append(ParseEvent("truncated", later, expected, "next header before expected tail"))
-                    del buffer[:later]
+                    discard(later)
                     continue
                 return
             frame = bytes(buffer[:expected])
             if valid_crc(frame, config):
                 result.frames.append(frame)
-                del buffer[:expected]
+                first_line, first_timestamp = origins[0] if origins else (0, None)
+                last_line, last_timestamp = origins[expected - 1] if len(origins) >= expected else (first_line, first_timestamp)
+                result.frame_evidence.append(FrameEvidence(frame, first_line, last_line, first_timestamp, last_timestamp))
+                discard(expected)
                 pending_at = None
             else:
                 result.events.append(ParseEvent("crc_error", expected, expected, "resynchronizing one byte"))
-                del buffer[0]
+                discard(1)
 
     for chunk in chunks:
         if buffer and pending_at and chunk.timestamp and config.max_frame_gap_ms is not None:
@@ -200,6 +221,7 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
             if elapsed > config.max_frame_gap_ms:
                 classify_incomplete(f"frame gap {elapsed:.1f} ms exceeds limit")
         buffer.extend(chunk.data)
+        origins.extend([(chunk.line_no, chunk.timestamp)] * len(chunk.data))
         pending_at = chunk.timestamp or pending_at
         consume()
     if buffer:

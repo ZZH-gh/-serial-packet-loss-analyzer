@@ -35,6 +35,13 @@ class SerialLogTests(unittest.TestCase):
         self.assertEqual(model.evidence_cycles, 2)
         self.assertEqual([cycle.missing for cycle in cycles if cycle.included], [2, 2])
 
+    def test_cycle_coverage_threshold_is_configurable(self):
+        complete = list(range(1, 11))
+        result = analyze_cycles(complete + [1, 2, 3, 4] + complete, min_coverage=0.4)
+        self.assertIsNotNone(result)
+        _, cycles = result
+        self.assertTrue(cycles[1].included)
+
     def test_transaction_pairing_is_separate_from_receive_loss(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
         tx = RxChunk(b"\xFF\x01\x03", now, 1)
@@ -47,6 +54,14 @@ class SerialLogTests(unittest.TestCase):
         result = match_transactions(read)
         self.assertEqual((result.paired, result.unmatched_sent, result.orphan_received, result.key_confirmed), (1, 0, 0, 1))
         self.assertEqual(result.average_latency_ms, 30.0)
+
+    def test_transaction_timeout_does_not_pair_stale_request(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        tx = RxChunk(b"\x01\x03", now, 1)
+        rx = RxChunk(b"\x01\x03\x00", now + timedelta(milliseconds=31), 2)
+        read = DirectionRead(rx_chunks=[rx], tx_chunks=[tx], records=[LoggedChunk("tx", tx), LoggedChunk("rx", rx)])
+        result = match_transactions(read, timeout_ms=30)
+        self.assertEqual((result.paired, result.timed_out_sent, result.orphan_received), (0, 1, 1))
 
 
 if __name__ == "__main__":

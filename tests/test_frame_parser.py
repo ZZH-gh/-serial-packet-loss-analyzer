@@ -9,8 +9,9 @@ from frame_parser import CrcKind, FrameConfig, FrameProtocol, RxChunk, crc16_mod
 
 class FrameParserTests(unittest.TestCase):
     def test_frame_can_span_two_receives(self):
-        result = parse_chunks([RxChunk(b"\xAA\x55\x01"), RxChunk(b"\x02\x03")], FrameConfig(b"\xAA\x55", fixed_length=5))
+        result = parse_chunks([RxChunk(b"\xAA\x55\x01", line_no=7), RxChunk(b"\x02\x03", line_no=9)], FrameConfig(b"\xAA\x55", fixed_length=5))
         self.assertEqual(result.frames, [b"\xAA\x55\x01\x02\x03"])
+        self.assertEqual((result.frame_evidence[0].first_line_no, result.frame_evidence[0].last_line_no), (7, 9))
         self.assertFalse(result.events)
 
     def test_truncated_tail_is_not_a_frame(self):
