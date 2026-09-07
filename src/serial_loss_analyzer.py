@@ -12,12 +12,14 @@ import csv
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
 HEX_BYTE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
 RX_MARKER = re.compile(r"\b(?:rx|recv|receive|received)\b|接收|收到|<<|←", re.IGNORECASE)
 TX_MARKER = re.compile(r"\b(?:tx|send|sent)\b|发送|发出|>>|→", re.IGNORECASE)
+TIMESTAMP_PREFIX = re.compile(r"^\s*(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*")
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ def read_bytes(path: Path) -> bytes:
     return bytes(int(token.group(), 16) for token in HEX_BYTE.finditer(text))
 
 
-def read_receive_bytes(path: Path) -> tuple[bytes, bool, int]:
+def read_receive_chunks(path: Path):
     """Extract RX bytes from common SSCOM-style direction-tagged logs.
 
     Returns (data, direction_markers_found, rx_line_count).  When no direction
@@ -71,23 +73,40 @@ def read_receive_bytes(path: Path) -> tuple[bytes, bool, int]:
     remain usable; callers should display that limitation to the user.
     """
     text = path.read_text(encoding="utf-8-sig", errors="replace")
+    from frame_parser import RxChunk
+
     active_rx = False
     found_marker = False
     rx_lines = 0
-    data = bytearray()
-    for line in text.splitlines():
+    chunks = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
         is_rx = bool(RX_MARKER.search(line))
         is_tx = bool(TX_MARKER.search(line))
         if is_rx or is_tx:
             found_marker = True
             active_rx = is_rx and not is_tx
-        tokens = list(HEX_BYTE.finditer(line))
+        timestamp = None
+        payload = line
+        match = TIMESTAMP_PREFIX.match(line)
+        if match:
+            payload = line[match.end():]
+            try:
+                stamp = f"{match.group(1) or '1900-01-01'} {match.group(2).replace(',', '.')}"
+                timestamp = datetime.fromisoformat(stamp.replace('/', '-'))
+            except ValueError:
+                pass
+        tokens = list(HEX_BYTE.finditer(payload))
         if active_rx and tokens:
-            data.extend(int(token.group(), 16) for token in tokens)
+            chunks.append(RxChunk(bytes(int(token.group(), 16) for token in tokens), timestamp, line_no))
             rx_lines += 1
     if not found_marker:
-        return read_bytes(path), False, 0
-    return bytes(data), True, rx_lines
+        return [RxChunk(read_bytes(path))], False, 0
+    return chunks, True, rx_lines
+
+
+def read_receive_bytes(path: Path) -> tuple[bytes, bool, int]:
+    chunks, found_marker, rx_lines = read_receive_chunks(path)
+    return b"".join(chunk.data for chunk in chunks), found_marker, rx_lines
 
 
 def frames(stream: bytes, header: bytes, frame_size: int):

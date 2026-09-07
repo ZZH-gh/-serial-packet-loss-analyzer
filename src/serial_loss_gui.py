@@ -14,7 +14,8 @@ from tkinter import BOTH, END, LEFT, RIGHT, StringVar, filedialog, messagebox, t
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from serial_loss_analyzer import CycleResult, Gap, analyze_cycles, detect_protocol, frames, parse_hex, read_receive_bytes
+from frame_parser import CrcKind, FrameConfig, parse_chunks
+from serial_loss_analyzer import CycleResult, Gap, analyze_cycles, detect_protocol, parse_hex, read_receive_chunks
 
 
 class LossAnalyzerApp:
@@ -31,11 +32,13 @@ class LossAnalyzerApp:
         self.seq_size = StringVar(value="2")
         self.endian = StringVar(value="little")
         self.max_gap = StringVar(value="1000")
+        self.crc = StringVar(value=CrcKind.NONE.value)
         self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV 文件，或点击“选择日志文件”。")
         self.gaps: list[Gap] = []
         self.cycle_results: list[CycleResult] = []
         self.cyclic_mode = False
         self.input_stream = b""
+        self.input_chunks = []
         self.direction_note = ""
         self._build()
 
@@ -77,7 +80,8 @@ class LossAnalyzerApp:
             ("序号偏移", self.seq_offset, 10),
             ("序号字节数", self.seq_size, 8),
             ("字节序", self.endian, 9),
-            ("最大连续缺失", self.max_gap, 12),
+            ("帧内超时(ms,0关闭)", self.max_gap, 14),
+            ("CRC", self.crc, 14),
         ]
         for column, (label, variable, width) in enumerate(fields):
             ttk.Label(config, text=label).grid(row=0, column=column, padx=4, sticky="w")
@@ -85,6 +89,8 @@ class LossAnalyzerApp:
                 widget = ttk.Combobox(config, textvariable=variable, values=("1", "2", "4"), width=width, state="readonly")
             elif label == "字节序":
                 widget = ttk.Combobox(config, textvariable=variable, values=("little", "big"), width=width, state="readonly")
+            elif label == "CRC":
+                widget = ttk.Combobox(config, textvariable=variable, values=tuple(kind.value for kind in CrcKind), width=width, state="readonly")
             else:
                 widget = ttk.Entry(config, textvariable=variable, width=width)
             widget.grid(row=1, column=column, padx=4, pady=(2, 0), sticky="ew")
@@ -137,6 +143,8 @@ class LossAnalyzerApp:
         self.gaps = []
         self.cycle_results = []
         self.cyclic_mode = False
+        self.input_stream = b""
+        self.input_chunks = []
         self.table.delete(*self.table.get_children())
         self.export_button.configure(state="disabled")
         self.auto_detect(silent=True)
@@ -146,7 +154,8 @@ class LossAnalyzerApp:
             path = Path(self.file_path.get())
             if not path.is_file():
                 raise ValueError("请先拖入或选择日志文件。")
-            self.input_stream, has_markers, rx_lines = read_receive_bytes(path)
+            self.input_chunks, has_markers, rx_lines = read_receive_chunks(path)
+            self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
             self.direction_note = (
                 f"仅使用接收数据（识别到 {rx_lines} 行 RX/接收记录）。"
                 if has_markers
@@ -188,16 +197,21 @@ class LossAnalyzerApp:
                 raise ValueError("总帧长必须大于帧头长度。")
             if seq_offset < 0 or seq_offset + seq_size > frame_size:
                 raise ValueError("序号字段超出帧范围。")
-            if max_gap < 1:
-                raise ValueError("最大连续缺失必须至少为 1。")
-            if not self.input_stream:
-                self.input_stream, has_markers, rx_lines = read_receive_bytes(path)
+            if max_gap < 0:
+                raise ValueError("帧内超时不能小于 0。")
+            if not self.input_chunks:
+                self.input_chunks, has_markers, rx_lines = read_receive_chunks(path)
+                self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
                 self.direction_note = (
                     f"仅使用接收数据（识别到 {rx_lines} 行 RX/接收记录）。"
                     if has_markers
                     else "日志未发现 TX/RX 方向标记，暂按全部 HEX 数据分析。"
                 )
-            captured = list(frames(self.input_stream, header, frame_size))
+            parsed = parse_chunks(
+                self.input_chunks,
+                FrameConfig(header, fixed_length=frame_size, crc=CrcKind(self.crc.get()), max_frame_gap_ms=max_gap or None),
+            )
+            captured = parsed.frames
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
                 raise ValueError("没有找到完整帧。请检查帧头和总帧长。")
@@ -225,7 +239,7 @@ class LossAnalyzerApp:
                 self.table.insert("", END, values=(cycle.index, cycle.received, cycle.expected, result))
             ignored = len(self.cycle_results) - len(included)
             self.result.set(
-                f"{self.direction_note}\n循环模式：自动识别每轮理论帧数为 {expected}。共 {len(self.cycle_results)} 轮，纳入 {len(included)} 轮，忽略 {ignored} 轮。\n"
+                f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n循环模式：自动识别每轮理论帧数为 {expected}。共 {len(self.cycle_results)} 轮，纳入 {len(included)} 轮，忽略 {ignored} 轮。\n"
                 f"纳入循环的平均丢包率：{rate:.4f}%（少于 {expected / 2:g} 帧的循环未计入）。"
             )
         else:
@@ -247,7 +261,7 @@ class LossAnalyzerApp:
             for gap in self.gaps:
                 self.table.insert("", END, values=(gap.after, gap.first_missing, gap.last_missing, gap.count))
             self.result.set(
-                f"{self.direction_note}\n连续序号模式：接收帧数 {len(sequences)}，丢失帧数 {missing}，丢包率 {rate:.4f}%。\n"
+                f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n连续序号模式：接收帧数 {len(sequences)}，丢失帧数 {missing}，丢包率 {rate:.4f}%。\n"
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}"
             )
         self.export_button.configure(state="normal")
