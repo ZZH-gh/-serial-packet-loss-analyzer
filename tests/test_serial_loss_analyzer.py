@@ -91,6 +91,16 @@ class SerialLogTests(unittest.TestCase):
         _, windows = analyze_time_windows(evidence, [1, 2], 1, 10, 3600)
         self.assertEqual(windows[0].start.strftime("%H:%M:%S"), "12:00:00")
 
+    def test_time_windows_do_not_count_cycle_boundary_as_loss(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        evidence = [
+            FrameEvidence(b"a", first_timestamp=now),
+            FrameEvidence(b"b", first_timestamp=now + timedelta(milliseconds=10)),
+            FrameEvidence(b"c", first_timestamp=now + timedelta(milliseconds=20)),
+        ]
+        _, windows = analyze_time_windows(evidence, [9, 10, 1], 1, 1000, 60)
+        self.assertEqual(windows[0].missing, 0)
+
     def test_analyze_log_reuses_rx_only_pipeline_for_comparison(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "compare.dat"

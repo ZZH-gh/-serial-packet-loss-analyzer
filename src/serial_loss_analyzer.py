@@ -191,8 +191,13 @@ def analyze_time_windows(
                 bucket["intervals"].append(interval)
                 if long_limit is not None and interval > long_limit:
                     bucket["long"] += 1
+            # A descending value begins a newly captured cycle (or a device
+            # restart).  It is never evidence of all the values between the
+            # two cycles being lost, so leave that boundary out of the time
+            # bucket loss count.  Normal ascending sequence gaps still use
+            # modular arithmetic to keep the existing gap definition.
             advance = (value - previous_value) % modulus
-            if 2 <= advance <= max_sequence_gap + 1:
+            if value >= previous_value and 2 <= advance <= max_sequence_gap + 1:
                 bucket["missing"] += advance - 1
         previous_item, previous_value = item, value
     results = [

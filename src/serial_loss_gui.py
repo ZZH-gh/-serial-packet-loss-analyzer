@@ -313,10 +313,10 @@ class LossAnalyzerApp:
         self.time_table.pack(side=LEFT, fill=BOTH, expand=True)
         time_scroll.pack(side=RIGHT, fill="y")
 
-        self.comparison_table = ttk.Treeview(comparison_frame, columns=("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result"), show="headings", height=10)
+        self.comparison_table = ttk.Treeview(comparison_frame, columns=("file", "mode", "frames", "loss", "missing", "worst", "crc", "truncated", "direction", "result"), show="headings", height=10)
         for key, text, width in (
             ("file", "日志文件", 240), ("mode", "统计模式", 90), ("frames", "完整帧", 80),
-            ("loss", "丢包率", 85), ("missing", "缺失帧", 85), ("crc", "CRC错误", 85),
+            ("loss", "丢包率", 85), ("missing", "缺失帧", 85), ("worst", "最差循环", 105), ("crc", "CRC错误", 85),
             ("truncated", "截断", 70), ("direction", "RX/TX", 100), ("result", "结果", 190),
         ):
             self.comparison_table.heading(key, text=text)
@@ -396,6 +396,8 @@ class LossAnalyzerApp:
                 analysis = analyze_log(path, config, seq_offset, seq_size, endian, max_gap, coverage, manual_start, manual_count)
                 direction = analysis.direction_read
                 direction_text = f"{len(direction.rx_chunks)}/{len(direction.tx_chunks)}" if direction.direction_markers_found else "方向未知"
+                included_cycles = [cycle for cycle in analysis.cycle_results if cycle.included]
+                worst_cycle = max(included_cycles, key=lambda cycle: cycle.missing / cycle.expected) if included_cycles else None
                 result = (
                     f"循环 {analysis.cycle_model.first_sequence}..{analysis.cycle_model.last_sequence}"
                     if analysis.cycle_model else f"重复 {analysis.duplicates}；异常跳变 {analysis.resets}"
@@ -403,13 +405,14 @@ class LossAnalyzerApp:
                 row = {
                     "file": path.name, "mode": "循环" if analysis.cycle_model else "连续", "frames": str(len(analysis.sequences)),
                     "loss": f"{analysis.loss_percent:.4f}%", "missing": str(analysis.missing),
+                    "worst": f"第 {worst_cycle.index} 轮 {worst_cycle.missing / worst_cycle.expected * 100:.2f}%" if worst_cycle else "—",
                     "crc": str(analysis.parsed.crc_errors), "truncated": str(analysis.parsed.truncations),
                     "direction": direction_text, "result": result,
                 }
             except (OSError, ValueError) as error:
-                row = {"file": path.name, "mode": "—", "frames": "—", "loss": "—", "missing": "—", "crc": "—", "truncated": "—", "direction": "—", "result": f"无法分析：{error}"}
+                row = {"file": path.name, "mode": "—", "frames": "—", "loss": "—", "missing": "—", "worst": "—", "crc": "—", "truncated": "—", "direction": "—", "result": f"无法分析：{error}"}
             self.comparison_rows.append(row)
-            self.comparison_table.insert("", END, values=tuple(row[key] for key in ("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result")))
+            self.comparison_table.insert("", END, values=tuple(row[key] for key in ("file", "mode", "frames", "loss", "missing", "worst", "crc", "truncated", "direction", "result")))
         self.comparison_export_button.configure(state="normal" if self.comparison_rows else "disabled")
 
     def profile_values(self) -> dict[str, str]:
@@ -825,7 +828,7 @@ class LossAnalyzerApp:
         )
         if not filename:
             return
-        fields = ("file", "mode", "frames", "loss", "missing", "crc", "truncated", "direction", "result")
+        fields = ("file", "mode", "frames", "loss", "missing", "worst", "crc", "truncated", "direction", "result")
         with Path(filename).open("w", newline="", encoding="utf-8-sig") as output:
             writer = csv.DictWriter(output, fieldnames=fields)
             writer.writeheader()
