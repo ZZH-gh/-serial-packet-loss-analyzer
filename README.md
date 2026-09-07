@@ -42,7 +42,7 @@ py .\src\serial_loss_gui.py
 
 ```powershell
 py -m pip install -r requirements.txt pyinstaller
-py -m PyInstaller --noconfirm --onefile --windowed --name SerialLossAnalyzer --paths .\src --collect-all tkinterdnd2 .\src\serial_loss_gui.py
+py -m PyInstaller --noconfirm --onefile --windowed --name SerialLossAnalyzer --icon .\assets\serial_loss_analyzer.ico --paths .\src --collect-all tkinterdnd2 .\src\serial_loss_gui.py
 ```
 
 生成文件为 `dist\SerialLossAnalyzer.exe`。

@@ -27,7 +27,9 @@ class LossAnalyzerApp:
     def __init__(self, root) -> None:
         self.root = root
         self.root.title("串口日志丢包统计工具")
-        self.root.minsize(760, 560)
+        self.root.minsize(1080, 720)
+        self.root.geometry("1180x820")
+        self.root.configure(background="#EAF1F5")
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind("<<Drop>>", self.on_drop)
         self.file_path = StringVar()
@@ -62,35 +64,61 @@ class LossAnalyzerApp:
 
     def _build(self) -> None:
         style = ttk.Style()
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
-        style.configure("Hint.TLabel", foreground="#5b6573")
-        outer = ttk.Frame(self.root, padding=16)
+        style.theme_use("clam")
+        style.configure(".", font=("Microsoft YaHei UI", 9), background="#EAF1F5", foreground="#18324A")
+        style.configure("App.TFrame", background="#EAF1F5")
+        style.configure("Header.TFrame", background="#102A43")
+        style.configure("HeaderTitle.TLabel", background="#102A43", foreground="#FFFFFF", font=("Microsoft YaHei UI", 19, "bold"))
+        style.configure("HeaderMeta.TLabel", background="#102A43", foreground="#A9C3D7", font=("Microsoft YaHei UI", 9))
+        style.configure("Section.TLabel", background="#EAF1F5", foreground="#0B7189", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Hint.TLabel", background="#EAF1F5", foreground="#62778A", font=("Microsoft YaHei UI", 8))
+        style.configure("Drop.TLabel", background="#F9FCFD", foreground="#26526B", font=("Microsoft YaHei UI", 11, "bold"), relief="solid", borderwidth=1)
+        style.configure("TLabelframe", background="#EAF1F5", bordercolor="#C4D5DF", relief="solid")
+        style.configure("TLabelframe.Label", background="#EAF1F5", foreground="#1D536C", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("TEntry", fieldbackground="#FFFFFF", bordercolor="#B9CEDA", padding=6)
+        style.configure("TCombobox", fieldbackground="#FFFFFF", bordercolor="#B9CEDA", padding=5)
+        style.configure("Primary.TButton", background="#007C91", foreground="#FFFFFF", borderwidth=0, padding=(14, 8), font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Primary.TButton", background=[("active", "#006A7C"), ("disabled", "#B2C3CC")])
+        style.configure("Secondary.TButton", background="#DDEAF0", foreground="#164A62", borderwidth=0, padding=(12, 8))
+        style.map("Secondary.TButton", background=[("active", "#C8DDE7")])
+        style.configure("Export.TButton", background="#FFF0D3", foreground="#8A5400", borderwidth=0, padding=(11, 8))
+        style.map("Export.TButton", background=[("active", "#FFE0A8"), ("disabled", "#E7EDEF")])
+        style.configure("Status.TLabel", background="#F9FCFD", foreground="#27485C", relief="solid", borderwidth=1, padding=10, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#18324A", rowheight=30, bordercolor="#C4D5DF", font=("Consolas", 9))
+        style.configure("Treeview.Heading", background="#DCEAF0", foreground="#164A62", relief="flat", font=("Microsoft YaHei UI", 9, "bold"), padding=(7, 7))
+        style.map("Treeview", background=[("selected", "#BDEAE5")], foreground=[("selected", "#102A43")])
+        style.configure("TNotebook", background="#EAF1F5", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#D9E6EC", foreground="#426176", padding=(16, 8), font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#FFFFFF")], foreground=[("selected", "#007C91")])
+
+        outer = ttk.Frame(self.root, padding=18, style="App.TFrame")
         outer.pack(fill=BOTH, expand=True)
 
-        ttk.Label(outer, text="串口日志丢包统计", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="只用接收数据统计帧与序号丢失；收发配对仅作通信健康度核对。支持 SSCOM TXT/CSV。",
-            style="Hint.TLabel",
-        ).pack(anchor="w", pady=(2, 12))
+        header = ttk.Frame(outer, style="Header.TFrame", padding=(22, 16))
+        header.pack(fill="x", pady=(0, 14))
+        ttk.Label(header, text="串口日志丢包统计", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(header, text="RX 证据链  /  完整帧校验  /  序号缺失统计", style="HeaderMeta.TLabel").pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(outer, text="01  导入日志", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
         drop = ttk.Label(
             outer,
-            text="将日志文件拖到这里\n支持 .txt / .csv，也可点击右侧按钮选择",
+            text="拖入 SSCOM 导出的日志文件\nTXT / CSV  ·  可连续拖入新文件，无需重启",
             anchor="center",
-            relief="groove",
-            padding=18,
+            style="Drop.TLabel",
+            padding=16,
         )
         drop.pack(fill="x")
         drop.drop_target_register(DND_FILES)
         drop.dnd_bind("<<Drop>>", self.on_drop)
 
-        file_row = ttk.Frame(outer)
-        file_row.pack(fill="x", pady=10)
+        file_row = ttk.Frame(outer, style="App.TFrame")
+        file_row.pack(fill="x", pady=(10, 16))
         ttk.Entry(file_row, textvariable=self.file_path, state="readonly").pack(side=LEFT, fill="x", expand=True)
-        ttk.Button(file_row, text="选择日志文件", command=self.choose_file).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(file_row, text="选择日志文件", command=self.choose_file, style="Secondary.TButton").pack(side=RIGHT, padx=(10, 0))
 
-        config = ttk.LabelFrame(outer, text="协议参数", padding=10)
+        ttk.Label(outer, text="02  校验规则", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        config = ttk.LabelFrame(outer, text="协议与统计参数", padding=12)
         config.pack(fill="x")
         fields = [
             ("帧格式", self.profile, 16),
@@ -133,20 +161,21 @@ class LossAnalyzerApp:
             style="Hint.TLabel",
         ).grid(row=((len(fields) + 3) // 4) * 2, column=0, columnspan=4, padx=4, sticky="w")
 
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill="x", pady=12)
-        ttk.Button(buttons, text="自动识别协议", command=self.auto_detect).pack(side=LEFT)
-        ttk.Button(buttons, text="开始统计", command=self.analyze).pack(side=LEFT)
-        ttk.Button(buttons, text="保存方案", command=self.save_profile).pack(side=LEFT, padx=(8, 0))
-        ttk.Button(buttons, text="加载方案", command=self.load_profile).pack(side=LEFT, padx=(4, 0))
-        self.export_button = ttk.Button(buttons, text="导出缺失明细 CSV", command=self.export, state="disabled")
-        self.export_button.pack(side=LEFT, padx=8)
-        self.evidence_export_button = ttk.Button(buttons, text="导出解析证据 CSV", command=self.export_evidence, state="disabled")
-        self.evidence_export_button.pack(side=LEFT)
-        self.report_export_button = ttk.Button(buttons, text="导出复现报告 JSON", command=self.export_report, state="disabled")
+        buttons = ttk.Frame(outer, style="App.TFrame")
+        buttons.pack(fill="x", pady=(14, 10))
+        ttk.Button(buttons, text="自动识别", command=self.auto_detect, style="Secondary.TButton").pack(side=LEFT)
+        ttk.Button(buttons, text="开始统计", command=self.analyze, style="Primary.TButton").pack(side=LEFT, padx=(8, 18))
+        ttk.Button(buttons, text="保存方案", command=self.save_profile, style="Secondary.TButton").pack(side=LEFT)
+        ttk.Button(buttons, text="加载方案", command=self.load_profile, style="Secondary.TButton").pack(side=LEFT, padx=(4, 14))
+        self.export_button = ttk.Button(buttons, text="导出缺失 CSV", command=self.export, state="disabled", style="Export.TButton")
+        self.export_button.pack(side=LEFT)
+        self.evidence_export_button = ttk.Button(buttons, text="导出证据 CSV", command=self.export_evidence, state="disabled", style="Export.TButton")
+        self.evidence_export_button.pack(side=LEFT, padx=(4, 0))
+        self.report_export_button = ttk.Button(buttons, text="导出报告 JSON", command=self.export_report, state="disabled", style="Export.TButton")
         self.report_export_button.pack(side=LEFT, padx=(4, 0))
 
-        ttk.Label(outer, textvariable=self.result, justify="left", font=("Consolas", 10)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(outer, text="03  分析结果", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel").pack(fill="x", pady=(0, 10))
         notebook = ttk.Notebook(outer)
         notebook.pack(fill=BOTH, expand=True)
         table_frame = ttk.Frame(notebook)
