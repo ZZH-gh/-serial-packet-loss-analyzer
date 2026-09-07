@@ -12,7 +12,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, StringVar, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -91,8 +91,35 @@ class LossAnalyzerApp:
         style.configure("TNotebook.Tab", background="#D9E6EC", foreground="#426176", padding=(16, 8), font=("Microsoft YaHei UI", 9, "bold"))
         style.map("TNotebook.Tab", background=[("selected", "#FFFFFF")], foreground=[("selected", "#007C91")])
 
-        outer = ttk.Frame(self.root, padding=18, style="App.TFrame")
-        outer.pack(fill=BOTH, expand=True)
+        scroll_host = ttk.Frame(self.root, style="App.TFrame")
+        scroll_host.pack(fill=BOTH, expand=True)
+        canvas = Canvas(scroll_host, background="#EAF1F5", highlightthickness=0, borderwidth=0)
+        page_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=page_scroll.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        page_scroll.pack(side=RIGHT, fill="y")
+        outer = ttk.Frame(canvas, padding=18, style="App.TFrame")
+        page_window = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def sync_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_page_width(event) -> None:
+            canvas.itemconfigure(page_window, width=event.width)
+
+        def scroll_page(event) -> str | None:
+            # Let result tables keep their own wheel behavior; use the page
+            # scrollbar for every other control and blank area.
+            if isinstance(event.widget, ttk.Treeview):
+                return None
+            if canvas.bbox("all") and canvas.bbox("all")[3] > canvas.winfo_height():
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+                return "break"
+            return None
+
+        outer.bind("<Configure>", sync_scroll_region)
+        canvas.bind("<Configure>", fit_page_width)
+        self.root.bind_all("<MouseWheel>", scroll_page, add="+")
 
         header = ttk.Frame(outer, style="Header.TFrame", padding=(22, 16))
         header.pack(fill="x", pady=(0, 14))
@@ -103,7 +130,7 @@ class LossAnalyzerApp:
 
         drop = ttk.Label(
             outer,
-            text="拖入 SSCOM 导出的日志文件\nTXT / CSV  ·  可连续拖入新文件，无需重启",
+            text="拖入 SSCOM 导出的日志文件\nTXT / CSV / DAT  ·  可连续拖入新文件，无需重启",
             anchor="center",
             style="Drop.TLabel",
             padding=16,
@@ -330,7 +357,7 @@ class LossAnalyzerApp:
     def choose_file(self) -> None:
         filename = filedialog.askopenfilename(
             title="选择 SSCOM 导出日志",
-            filetypes=(("日志文件", "*.txt *.csv"), ("文本文件", "*.txt"), ("CSV 文件", "*.csv"), ("所有文件", "*.*")),
+            filetypes=(("日志文件", "*.txt *.csv *.dat"), ("文本文件", "*.txt"), ("CSV 文件", "*.csv"), ("DAT 文件", "*.dat"), ("所有文件", "*.*")),
         )
         if filename:
             self.load_file(Path(filename))
@@ -341,8 +368,8 @@ class LossAnalyzerApp:
             self.load_file(Path(paths[0]))
 
     def load_file(self, path: Path) -> None:
-        if path.suffix.lower() not in {".txt", ".csv"}:
-            messagebox.showerror("文件类型不支持", "请选择 TXT 或 CSV 日志文件。")
+        if path.suffix.lower() not in {".txt", ".csv", ".dat"}:
+            messagebox.showerror("文件类型不支持", "请选择 TXT、CSV 或 DAT 日志文件。")
             return
         self.file_path.set(str(path))
         self.gaps = []
