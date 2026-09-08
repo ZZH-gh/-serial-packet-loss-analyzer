@@ -122,6 +122,7 @@ class LossAnalyzerApp:
         self.preview_count = 0
         self.cancel_requested = False
         self._setting_parameters = False
+        self._auto_display_mode: str | None = None
         self._build()
         self._watch_parameters()
 
@@ -252,13 +253,13 @@ class LossAnalyzerApp:
                 help_mark.pack(side=LEFT)
                 Tooltip(help_mark, PARAMETER_HELP[label])
             if label == "帧格式":
-                widget = ttk.Combobox(config, textvariable=variable, values=("自定义固定帧", "自定义长度字段帧", "Modbus RTU（CRC自动帧长）"), width=width, state="readonly")
+                widget = ttk.Combobox(config, textvariable=variable, values=("自定义固定帧", "自定义长度字段帧", "Modbus RTU（CRC自动帧长）", "时间戳表格（自动）"), width=width, state="readonly")
             elif label in {"序号字节数", "长度字段字节数"}:
-                widget = ttk.Combobox(config, textvariable=variable, values=("1", "2", "4"), width=width, state="readonly")
+                widget = ttk.Combobox(config, textvariable=variable, values=("1", "2", "4", "不适用"), width=width, state="readonly")
             elif label in {"字节序", "长度字段字节序"}:
-                widget = ttk.Combobox(config, textvariable=variable, values=("little", "big"), width=width, state="readonly")
+                widget = ttk.Combobox(config, textvariable=variable, values=("little", "big", "不适用"), width=width, state="readonly")
             elif label == "CRC":
-                widget = ttk.Combobox(config, textvariable=variable, values=tuple(kind.value for kind in CrcKind), width=width, state="readonly")
+                widget = ttk.Combobox(config, textvariable=variable, values=tuple(kind.value for kind in CrcKind) + ("不适用",), width=width, state="readonly")
             else:
                 widget = ttk.Entry(config, textvariable=variable, width=width)
             widget.grid(row=row + 1, column=grid_column, padx=4, pady=(2, 8), sticky="ew")
@@ -310,7 +311,7 @@ class LossAnalyzerApp:
         ttk.Label(metric_copy, textvariable=self.primary_loss_detail, style="MetricContext.TLabel", wraplength=680, justify="left").pack(anchor="w", pady=(5, 0))
         self.primary_loss_value = ttk.Label(metric_panel, textvariable=self.primary_loss, style="MetricGood.TLabel", padding=(18, 18))
         self.primary_loss_value.pack(side=RIGHT)
-        ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel").pack(fill="x", pady=(0, 10))
+        self.result_label = ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel")
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill=BOTH, expand=True)
         table_frame = ttk.Frame(self.notebook)
@@ -391,6 +392,7 @@ class LossAnalyzerApp:
         self.comparison_table.configure(yscrollcommand=comparison_scroll.set)
         self.comparison_table.pack(side=LEFT, fill=BOTH, expand=True)
         comparison_scroll.pack(side=RIGHT, fill="y")
+        self.result_label.pack(fill="x", pady=(10, 0))
 
     def _watch_parameters(self) -> None:
         for variable in (
@@ -401,9 +403,81 @@ class LossAnalyzerApp:
         ):
             variable.trace_add("write", self._on_parameter_change)
 
+    def restore_protocol_parameter_inputs(self) -> None:
+        """Restore editable protocol defaults after leaving an auto-display mode."""
+        self._setting_parameters = True
+        try:
+            self.header.set("AA55")
+            self.frame_size.set("18")
+            self.length_offset.set("2")
+            self.length_size.set("1")
+            self.length_endian.set("little")
+            self.length_adjust.set("0")
+            self.seq_offset.set("2")
+            self.seq_size.set("2")
+            self.endian.set("little")
+            self.max_gap.set("1000")
+            self.crc.set(CrcKind.NONE.value)
+            self.cycle_coverage.set("50")
+            self.transaction_timeout.set("1500")
+            self.manual_cycle_start.set("")
+            self.manual_cycle_count.set("")
+        finally:
+            self._setting_parameters = False
+        self._auto_display_mode = None
+
+    def show_timestamp_table_parameters(self) -> None:
+        """Replace irrelevant frame controls with the actual table structure."""
+        if self.timestamp_table is None:
+            return
+        self._setting_parameters = True
+        try:
+            self.profile.set("时间戳表格（自动）")
+            self.header.set("每行 = 1 条记录")
+            self.frame_size.set(f"{self.timestamp_table.field_count} 列 + 行尾时间戳")
+            self.length_offset.set("不适用")
+            self.length_size.set("不适用")
+            self.length_endian.set("不适用")
+            self.length_adjust.set("不适用")
+            self.seq_offset.set("无递增序号")
+            self.seq_size.set("不适用")
+            self.endian.set("不适用")
+            self.max_gap.set("不适用")
+            self.crc.set("不适用")
+            self.cycle_coverage.set("不适用")
+            self.transaction_timeout.set("不适用")
+            self.manual_cycle_start.set("不适用")
+            self.manual_cycle_count.set("不适用")
+        finally:
+            self._setting_parameters = False
+        self._auto_display_mode = "timestamp_table"
+
+    def show_modbus_parameters(self, frames: list[bytes]) -> str:
+        """Expose observed Modbus address/function pairs instead of a fake fixed header."""
+        pairs = sorted({(frame[0], frame[1] & 0x7F) for frame in frames if len(frame) >= 2})
+        display_pairs = "、".join(f"{address:02X}/{function:02X}" for address, function in pairs[:3])
+        if len(pairs) > 3:
+            display_pairs += f" 等 {len(pairs)} 种"
+        if not display_pairs:
+            display_pairs = "未提取"
+        minimum = min(map(len, frames)) if frames else 0
+        maximum = max(map(len, frames)) if frames else 0
+        self._setting_parameters = True
+        try:
+            self.header.set(f"动态：{display_pairs}")
+            self.frame_size.set(f"自动：{minimum}~{maximum} B")
+        finally:
+            self._setting_parameters = False
+        self._auto_display_mode = "modbus"
+        return display_pairs
+
     def _on_parameter_change(self, *_args) -> None:
         if self._setting_parameters:
             return
+        if self._auto_display_mode == "modbus" and not self.profile.get().startswith("Modbus"):
+            self.restore_protocol_parameter_inputs()
+        elif self._auto_display_mode == "timestamp_table" and self.profile.get() != "时间戳表格（自动）":
+            self.restore_protocol_parameter_inputs()
         if self.timestamp_table is not None:
             self.parameter_source.set("自动识别：时间戳表格日志（无需帧参数）")
             self.preview_note.set("此类日志按“每行一条记录 + 末尾时间戳”统计；修改时间窗口后重新点击“开始统计”即可。")
@@ -853,6 +927,13 @@ class LossAnalyzerApp:
         if path.suffix.lower() not in {".txt", ".csv", ".dat"}:
             messagebox.showerror("文件类型不支持", "请选择 TXT、CSV 或 DAT 日志文件。")
             return
+        if self.profile.get() == "时间戳表格（自动）":
+            self._setting_parameters = True
+            try:
+                self.profile.set("自定义固定帧")
+            finally:
+                self._setting_parameters = False
+            self.restore_protocol_parameter_inputs()
         self.file_path.set(str(path))
         self.compare_paths = comparison_paths or [path]
         self.gaps = []
@@ -888,6 +969,7 @@ class LossAnalyzerApp:
                 raise ValueError("请先拖入或选择日志文件。")
             self.timestamp_table = detect_timestamp_table(path, self.progress_callback("正在识别时间戳表格"))
             if self.timestamp_table is not None:
+                self.show_timestamp_table_parameters()
                 self.parameter_source.set("自动识别：时间戳表格日志（无需帧参数）")
                 self.preview_note.set("此类日志按“每行一条记录 + 末尾时间戳”统计，不进行帧参数自检。")
                 self.preview_button.configure(text="时间规则预览")
@@ -929,8 +1011,6 @@ class LossAnalyzerApp:
                 self._setting_parameters = True
                 try:
                     self.profile.set("Modbus RTU（CRC自动帧长）")
-                    self.header.set("任意站号 + 功能码")
-                    self.frame_size.set("自动")
                     self.crc.set(CrcKind.MODBUS.value)
                     if suggested:
                         self.seq_offset.set(str(suggested[0]))
@@ -941,6 +1021,7 @@ class LossAnalyzerApp:
                         sequence_text = "未发现可信的递增序号字段"
                 finally:
                     self._setting_parameters = False
+                observed_pairs = self.show_modbus_parameters(captured)
                 self.parameter_source.set("自动识别候选（请自检）")
                 self.invalidate_preview()
                 self.result.set(
@@ -948,7 +1029,7 @@ class LossAnalyzerApp:
                     f"{self.direction_note}\n{self.transaction_note}\n请核对序号字段后点击“开始统计”。"
                 )
                 self.rule_summary.set(
-                    f"当前文件识别：Modbus RTU；完整 CRC 通过帧 {len(captured)} 条；{sequence_text}。"
+                    f"当前文件识别：Modbus RTU；完整 CRC 通过帧 {len(captured)} 条；实际站号/功能码 {observed_pairs}；{sequence_text}。"
                     "以下参数是候选值，点击“参数自检”可查看具体帧。"
                 )
                 return
