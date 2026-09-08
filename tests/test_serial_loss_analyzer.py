@@ -83,6 +83,31 @@ class SerialLogTests(unittest.TestCase):
         result = match_transactions(read, timeout_ms=30)
         self.assertEqual((result.paired, result.timed_out_sent, result.orphan_received), (0, 1, 1))
 
+    def test_modbus_transaction_matching_uses_address_and_function_not_oldest_tx(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        tx_one = RxChunk(b"\x01\x03\x00\x00", now, 1)
+        tx_two = RxChunk(b"\x02\x03\x00\x00", now + timedelta(milliseconds=5), 2)
+        rx_two = RxChunk(b"\x02\x03\x3c" + b"\x00" * 60, now + timedelta(milliseconds=20), 3)
+        read = DirectionRead(
+            tx_chunks=[tx_one, tx_two], rx_chunks=[rx_two],
+            records=[LoggedChunk("tx", tx_one), LoggedChunk("tx", tx_two), LoggedChunk("rx", rx_two)],
+            direction_markers_found=True,
+        )
+        result = match_transactions(read)
+        self.assertEqual((result.eligible_sent, result.eligible_paired, result.eligible_unmatched), (2, 1, 1))
+        self.assertEqual(result.response_loss_percent, 50.0)
+
+    def test_modbus_read_response_requires_the_requested_byte_count(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        tx = RxChunk(b"\x01\x03\x00\x00\x00\x1e\x00\x00", now, 1)
+        wrong_rx = RxChunk(b"\x01\x03\x3a" + b"\x00" * 58, now + timedelta(milliseconds=20), 2)
+        read = DirectionRead(
+            tx_chunks=[tx], rx_chunks=[wrong_rx],
+            records=[LoggedChunk("tx", tx), LoggedChunk("rx", wrong_rx)], direction_markers_found=True,
+        )
+        result = match_transactions(read)
+        self.assertEqual((result.eligible_paired, result.eligible_unmatched, result.orphan_received), (0, 1, 1))
+
     def test_time_windows_locate_missing_sequence_and_long_interval(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
         evidence = [

@@ -1001,11 +1001,18 @@ class LossAnalyzerApp:
             transaction = match_transactions(self.direction_read, timeout)
             if has_markers and (transaction.sent or transaction.received):
                 latency = f"，平均往返 {transaction.average_latency_ms:.1f} ms" if transaction.average_latency_ms is not None else ""
-                self.transaction_note = (
-                    f"收发核对（不参与丢包率）：TX {transaction.sent}，RX {transaction.received}，按时间配对 {transaction.paired}，"
-                    f"未响应TX {transaction.unmatched_sent}（超时 {transaction.timed_out_sent}），孤立RX {transaction.orphan_received}，"
-                    f"命令地址/功能码证实 {transaction.key_confirmed}{latency}。"
-                )
+                if transaction.eligible_sent:
+                    self.transaction_note = (
+                        f"请求应答统计（TX→RX）：Modbus请求 {transaction.eligible_sent}，匹配响应 {transaction.eligible_paired}，"
+                        f"未响应 {transaction.eligible_unmatched}，未响应率 {transaction.response_loss_percent:.2f}%；"
+                        f"超时 {transaction.timed_out_sent}，孤立RX {transaction.orphan_received}{latency}。"
+                    )
+                else:
+                    self.transaction_note = (
+                        f"收发核对（不参与丢包率）：TX {transaction.sent}，RX {transaction.received}，按时间配对 {transaction.paired}，"
+                        f"未响应TX {transaction.unmatched_sent}（超时 {transaction.timed_out_sent}），孤立RX {transaction.orphan_received}，"
+                        f"未识别到可统计的 Modbus 请求{latency}。"
+                    )
             else:
                 self.transaction_note = ""
             modbus = detect_modbus_rtu(self.input_chunks, self.progress_callback("正在验证 Modbus 帧"))
@@ -1372,6 +1379,10 @@ class LossAnalyzerApp:
                 "unmatched_sent": transaction.unmatched_sent, "timed_out_sent": transaction.timed_out_sent,
                 "orphan_received": transaction.orphan_received, "key_confirmed": transaction.key_confirmed,
                 "average_latency_ms": transaction.average_latency_ms,
+                "eligible_modbus_requests": transaction.eligible_sent,
+                "matched_modbus_responses": transaction.eligible_paired,
+                "unmatched_modbus_requests": transaction.eligible_unmatched,
+                "response_loss_percent": transaction.response_loss_percent,
             },
             "evidence_csv_columns": ["frame", "lines", "time", "bytes", "sequence", "status"],
             "comparisons": self.comparison_rows,
@@ -1383,14 +1394,34 @@ class LossAnalyzerApp:
     def show_sequence_unavailable(self, parsed, captured: list[bytes]) -> None:
         """Present frame-integrity evidence without fabricating a loss rate."""
         self.table.delete(*self.table.get_children())
-        self.set_table_headings((("after", "有效完整帧"), ("first", "CRC错误"), ("last", "截断"), ("count", "噪声字节")))
-        self.table.insert("", END, values=(len(captured), parsed.crc_errors, parsed.truncations, parsed.noise_bytes))
-        detail = "当前帧内没有可信递增序号；原始 RX 文件也没有时间戳，不能从已收到的帧反推出整帧漏收。"
-        self.set_primary_loss_unavailable(detail)
+        transaction = (
+            match_transactions(self.direction_read, self.transaction_timeout_value())
+            if self.direction_read and self.direction_read.direction_markers_found else None
+        )
+        if transaction and transaction.response_loss_percent is not None:
+            self.set_table_headings((("after", "Modbus请求"), ("first", "匹配响应"), ("last", "未响应"), ("count", "未响应率")))
+            self.table.insert("", END, values=(
+                transaction.eligible_sent, transaction.eligible_paired,
+                transaction.eligible_unmatched, f"{transaction.response_loss_percent:.4f}%",
+            ))
+            detail = "按同一 Modbus 地址、功能码及读取字节数匹配 TX 请求与后续 RX 响应；每个未匹配请求计为一次未响应。"
+            self.set_primary_loss(transaction.response_loss_percent, "请求未响应率（TX→RX）", detail)
+            response_text = (
+                f"请求应答：Modbus请求 {transaction.eligible_sent}，匹配响应 {transaction.eligible_paired}，"
+                f"未响应 {transaction.eligible_unmatched}，未响应率 {transaction.response_loss_percent:.4f}%。"
+            )
+        else:
+            self.set_table_headings((("after", "有效完整帧"), ("first", "CRC错误"), ("last", "截断"), ("count", "噪声字节")))
+            self.table.insert("", END, values=(len(captured), parsed.crc_errors, parsed.truncations, parsed.noise_bytes))
+            detail = "当前帧内没有可信递增序号；原始 RX 文件也没有时间戳，不能从已收到的帧反推出整帧漏收。"
+            self.set_primary_loss_unavailable(detail)
+            response_text = (
+                "未发现可信递增序号：不计算丢包率，避免把测量值波动误判为漏包。"
+                "若协议确有序号，请填写正确偏移/字节数并勾选“手动确认以上序号字段”。"
+            )
         self.result.set(
             f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n"
-            "未发现可信递增序号：不计算丢包率，避免把测量值波动误判为漏包。"
-            "若协议确有序号，请填写正确偏移/字节数并勾选“手动确认以上序号字段”。"
+            + response_text
         )
         self.evidence.delete(*self.evidence.get_children())
         self.evidence_rows = []

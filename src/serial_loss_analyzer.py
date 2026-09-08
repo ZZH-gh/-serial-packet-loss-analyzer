@@ -112,6 +112,18 @@ class TransactionSummary:
     orphan_received: int
     key_confirmed: int
     latency_ms: tuple[float, ...]
+    eligible_sent: int = 0
+    eligible_paired: int = 0
+
+    @property
+    def eligible_unmatched(self) -> int:
+        return self.eligible_sent - self.eligible_paired
+
+    @property
+    def response_loss_percent(self) -> float | None:
+        if not self.eligible_sent:
+            return None
+        return 100 * self.eligible_unmatched / self.eligible_sent
 
     @property
     def average_latency_ms(self) -> float | None:
@@ -801,31 +813,77 @@ def detect_modbus_rtu(
     return parsed.frames, parsed
 
 
+def _modbus_key(data: bytes, is_request: bool) -> tuple[int, int, int | None] | None:
+    """Find a Modbus command key plus its expected/actual response size.
+
+    For read-holding/read-input-register commands (03/04), a request's
+    register count predicts the response byte-count.  Checking it prevents a
+    response for a different read command from satisfying the oldest request.
+    """
+    for index in range(max(0, len(data) - 1)):
+        address, function = data[index], data[index + 1] & 0x7F
+        if 1 <= address <= 247 and 1 <= function <= 0x7F:
+            byte_count = None
+            if function in (0x03, 0x04):
+                if is_request and len(data) >= index + 6:
+                    register_count = int.from_bytes(data[index + 4 : index + 6], "big")
+                    if 1 <= register_count <= 125:
+                        byte_count = register_count * 2
+                elif not is_request and len(data) >= index + 3:
+                    byte_count = data[index + 2]
+            return address, function, byte_count
+    return None
+
+
 def match_transactions(direction_read: DirectionRead, timeout_ms: int | None = 1500) -> TransactionSummary:
-    """Pair each TX with the next RX; never use this for RX loss statistics."""
-    waiting = []
+    """Pair TX requests with later RX replies, preferring the Modbus command key.
+
+    A matching address/function pair is required when both records look like
+    Modbus.  This avoids treating an unrelated response as the answer to the
+    oldest request when a log contains more than one command type.
+    """
+    waiting: list[tuple[object, tuple[int, int, int | None] | None]] = []
     paired = orphan = key_confirmed = timed_out = 0
+    eligible_sent = eligible_paired = 0
     latencies: list[float] = []
     for record in direction_read.records:
         if record.direction == "tx":
-            waiting.append(record.chunk)
+            key = _modbus_key(record.chunk.data, is_request=True)
+            waiting.append((record.chunk, key))
+            eligible_sent += int(key is not None)
         elif record.direction == "rx":
             while (
-                waiting and timeout_ms is not None and waiting[0].timestamp and record.chunk.timestamp
-                and (record.chunk.timestamp - waiting[0].timestamp).total_seconds() * 1000 > timeout_ms
+                waiting and timeout_ms is not None and waiting[0][0].timestamp and record.chunk.timestamp
+                and (record.chunk.timestamp - waiting[0][0].timestamp).total_seconds() * 1000 > timeout_ms
             ):
                 waiting.pop(0)
                 timed_out += 1
             if not waiting:
                 orphan += 1
                 continue
-            tx = waiting.pop(0)
+            rx_key = _modbus_key(record.chunk.data, is_request=False)
+            match_index = next((
+                index for index, (_tx, tx_key) in enumerate(waiting)
+                if (
+                    rx_key is not None and tx_key is not None
+                    and tx_key[:2] == rx_key[:2]
+                    and (tx_key[2] is None or rx_key[2] is None or tx_key[2] == rx_key[2])
+                )
+            ), None)
+            if match_index is None:
+                # Preserve generic chronology pairing for non-Modbus logs, but
+                # do not claim it as a command-confirmed response.
+                if rx_key is not None and any(tx_key is not None for _tx, tx_key in waiting):
+                    orphan += 1
+                    continue
+                match_index = 0
+            tx, tx_key = waiting.pop(match_index)
             paired += 1
-            # Some devices wrap a Modbus request in a proprietary header.  A
-            # matching address/function pair anywhere in TX is evidence, not
-            # a prerequisite for the chronological pairing.
-            if len(record.chunk.data) >= 2 and record.chunk.data[:2] in (tx.data[index : index + 2] for index in range(max(0, len(tx.data) - 1))):
+            if tx_key is not None and rx_key is not None and tx_key[:2] == rx_key[:2] and (
+                tx_key[2] is None or rx_key[2] is None or tx_key[2] == rx_key[2]
+            ):
                 key_confirmed += 1
+                eligible_paired += 1
             if tx.timestamp and record.chunk.timestamp:
                 elapsed = (record.chunk.timestamp - tx.timestamp).total_seconds() * 1000
                 if elapsed >= 0:
@@ -833,6 +891,7 @@ def match_transactions(direction_read: DirectionRead, timeout_ms: int | None = 1
     return TransactionSummary(
         len(direction_read.tx_chunks), len(direction_read.rx_chunks), paired,
         len(waiting) + timed_out, timed_out, orphan, key_confirmed, tuple(latencies),
+        eligible_sent, eligible_paired,
     )
 
 
