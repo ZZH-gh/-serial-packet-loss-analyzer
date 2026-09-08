@@ -101,6 +101,7 @@ class LossAnalyzerApp:
         self.primary_loss_label = StringVar(value="等待统计")
         self.primary_loss_detail = StringVar(value="完成统计后显示当前日志的核心丢包率与统计口径。")
         self.parameter_source = StringVar(value="默认参数（尚未自检）")
+        self.rule_summary = StringVar(value="导入日志后，这里会显示当前文件实际识别到的格式与统计口径。")
         self.preview_note = StringVar(value="点击“参数自检”后，这里会显示当前参数切出的前 10 帧。")
         self.progress_message = StringVar(value="")
         self.gaps: list[Gap] = []
@@ -219,7 +220,7 @@ class LossAnalyzerApp:
         ttk.Button(file_row, text="选择日志文件", command=self.choose_file, style="Secondary.TButton").pack(side=RIGHT, padx=(10, 0))
 
         ttk.Label(outer, text="02  校验规则", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        config = ttk.LabelFrame(outer, text="协议与统计参数", padding=12)
+        config = ttk.LabelFrame(outer, text="协议与统计参数（导入后显示当前识别规则）", padding=12)
         config.pack(fill="x")
         fields = [
             ("帧格式", self.profile, 16),
@@ -268,6 +269,9 @@ class LossAnalyzerApp:
             text="长度字段帧规则：总帧长 = 指定偏移处的长度字段值 + 调整值；固定总帧长在该模式下不使用。",
             style="Hint.TLabel",
         ).grid(row=((len(fields) + 3) // 4) * 2, column=0, columnspan=4, padx=4, sticky="w")
+        ttk.Label(
+            config, textvariable=self.rule_summary, justify="left", wraplength=1000, style="Verify.TLabel",
+        ).grid(row=((len(fields) + 3) // 4) * 2 + 1, column=0, columnspan=4, padx=4, pady=(8, 0), sticky="ew")
 
         buttons = ttk.Frame(outer, style="App.TFrame")
         buttons.pack(fill="x", pady=(14, 10))
@@ -413,6 +417,11 @@ class LossAnalyzerApp:
         self.preview_note.set("参数已变更；请点击“参数自检”，核对当前帧头、帧长和序号字段。")
         self.preview_table.delete(*self.preview_table.get_children())
 
+    def set_preview_headings(self, headings) -> None:
+        for key, text, width in headings:
+            self.preview_table.heading(key, text=text)
+            self.preview_table.column(key, width=width, anchor="w", stretch=key in {"bytes", "check"})
+
     def request_cancel(self) -> None:
         self.cancel_requested = True
         self.progress_message.set("正在取消…")
@@ -445,7 +454,7 @@ class LossAnalyzerApp:
         self.cancel_button.configure(state="disabled")
         self.auto_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
-        self.preview_button.configure(state="disabled" if self.timestamp_table is not None else "normal")
+        self.preview_button.configure(state="normal")
 
     def reset_primary_loss(self) -> None:
         self.primary_loss.set("—")
@@ -529,7 +538,57 @@ class LossAnalyzerApp:
         finally:
             self.finish_operation()
 
+    def preview_timestamp_rules(self, select_tab: bool = False) -> None:
+        """Display file-derived table validation samples in the existing preview tab."""
+        if self.timestamp_table is None or self.timestamp_gap_analysis is None:
+            return
+        analysis = self.timestamp_gap_analysis
+        gap_at_line = {gap.end.line_no: gap for gap in analysis.gaps}
+        self.preview_table.delete(*self.preview_table.get_children())
+        self.set_preview_headings((
+            ("frame", "记录样本", 80), ("lines", "日志行", 80), ("time", "记录时间", 125),
+            ("bytes", "识别到的数据结构", 220), ("sequence", "相邻间隔", 120), ("check", "文件校验结果", 350),
+        ))
+        previous = None
+        for index, row in enumerate(self.timestamp_table.rows[:10], start=1):
+            interval = "起始记录"
+            check = f"行尾时间戳有效；{self.timestamp_table.field_count} 列一致"
+            if previous is not None:
+                interval_ms = (row.timestamp - previous.timestamp).total_seconds() * 1000
+                interval = f"{interval_ms:.1f} ms"
+                if interval_ms < 0:
+                    check += "；时间倒退（不计漏采）"
+                elif row.line_no in gap_at_line:
+                    gap = gap_at_line[row.line_no]
+                    check += f"；时间断档，估计漏采 {gap.estimated_missing} 条"
+                else:
+                    check += "；处于自动学习的正常节拍内"
+            self.preview_table.insert(
+                "", END,
+                values=(index, row.line_no, row.timestamp.strftime("%H:%M:%S.%f")[:-3], f"{row.field_count} 个数据字段", interval, check),
+            )
+            previous = row
+        self.preview_confirmed = True
+        self.preview_count = min(10, len(self.timestamp_table.rows))
+        baseline = f"{analysis.baseline_interval_ms:.1f}" if analysis.baseline_interval_ms is not None else "不足"
+        upper = f"{analysis.normal_upper_interval_ms:.1f}" if analysis.normal_upper_interval_ms is not None else "—"
+        threshold = f"{analysis.threshold_ms:.1f}" if analysis.threshold_ms is not None else "—"
+        self.preview_note.set(
+            f"已随当前文件更新校验规则：{len(self.timestamp_table.rows)} 条有效记录，固定 {self.timestamp_table.field_count} 列，"
+            f"中位节拍 {baseline} ms，正常上沿 {upper} ms，"
+            f"断档阈值 {threshold} ms；断档 {len(analysis.gaps)} 处、疑似漏采 {analysis.suspected_missing} 条。"
+        )
+        if select_tab:
+            self.notebook.select(self.preview_table.master)
+
     def preview_parameters(self) -> None:
+        if self.timestamp_table is not None:
+            self.preview_timestamp_rules(select_tab=True)
+            return
+        self.set_preview_headings((
+            ("frame", "预览帧", 75), ("lines", "日志行", 85), ("time", "接收时间", 110),
+            ("bytes", "按当前参数切出的完整帧", 360), ("sequence", "当前序号字段", 120), ("check", "核对结果", 220),
+        ))
         try:
             path, config, seq_offset, seq_size, *_rest = self.analysis_setup()
             self.ensure_input_chunks(path)
@@ -804,6 +863,8 @@ class LossAnalyzerApp:
         self.direction_read = None
         self.timestamp_table = None
         self.timestamp_gap_analysis = None
+        self.rule_summary.set("导入日志后，这里会显示当前文件实际识别到的格式与统计口径。")
+        self.preview_button.configure(text="参数自检")
         self.table.delete(*self.table.get_children())
         self.evidence.delete(*self.evidence.get_children())
         self.time_table.delete(*self.time_table.get_children())
@@ -829,11 +890,13 @@ class LossAnalyzerApp:
             if self.timestamp_table is not None:
                 self.parameter_source.set("自动识别：时间戳表格日志（无需帧参数）")
                 self.preview_note.set("此类日志按“每行一条记录 + 末尾时间戳”统计，不进行帧参数自检。")
+                self.preview_button.configure(text="时间规则预览")
                 self.direction_note = (
                     f"已识别为时间戳表格日志：每条记录 {self.timestamp_table.field_count} 个数据字段，"
                     f"共 {len(self.timestamp_table.rows)} 条有效记录。"
                 )
                 self.analyze_timestamp_table()
+                self.preview_timestamp_rules()
                 return
             self.direction_read = read_directional_chunks(path, self.progress_callback("正在读取日志"))
             has_markers = self.direction_read.direction_markers_found
@@ -884,6 +947,10 @@ class LossAnalyzerApp:
                     f"已验证为 Modbus RTU：{len(captured)} 条完整帧全部经 CRC16-Modbus 校验；{sequence_text}。\n"
                     f"{self.direction_note}\n{self.transaction_note}\n请核对序号字段后点击“开始统计”。"
                 )
+                self.rule_summary.set(
+                    f"当前文件识别：Modbus RTU；完整 CRC 通过帧 {len(captured)} 条；{sequence_text}。"
+                    "以下参数是候选值，点击“参数自检”可查看具体帧。"
+                )
                 return
             detected = detect_protocol(self.input_stream, self.progress_callback("正在推断固定帧"))
             if detected is None:
@@ -906,6 +973,10 @@ class LossAnalyzerApp:
             self.result.set(
                 f"已自动识别：帧头 {detected.header.hex(' ').upper()}，总帧长 {detected.frame_size} 字节；{sequence_text}。\n"
                 f"{self.direction_note} 间距置信度 {detected.confidence:.0%}；请核对后点击“开始统计”。\n{self.transaction_note}"
+            )
+            self.rule_summary.set(
+                f"当前文件识别：固定帧头 {detected.header.hex(' ').upper()}，总帧长 {detected.frame_size} 字节，"
+                f"{sequence_text}，帧间距置信度 {detected.confidence:.0%}。"
             )
         except OperationCancelled:
             self.result.set("自动识别已取消；当前参数未改变。")
@@ -984,6 +1055,15 @@ class LossAnalyzerApp:
         analysis = analyze_timestamp_gaps(self.timestamp_table)
         windows = analyze_timestamp_windows(self.timestamp_table, analysis, time_window)
         self.timestamp_gap_analysis = analysis
+        baseline = f"{analysis.baseline_interval_ms:.1f} ms" if analysis.baseline_interval_ms is not None else "不足"
+        upper = f"{analysis.normal_upper_interval_ms:.1f} ms" if analysis.normal_upper_interval_ms is not None else "—"
+        threshold = f"{analysis.threshold_ms:.1f} ms" if analysis.threshold_ms is not None else "—"
+        self.rule_summary.set(
+            f"当前文件识别：时间戳表格；有效记录 {analysis.received} 条，固定 {self.timestamp_table.field_count} 列，"
+            f"异常行 {self.timestamp_table.invalid_rows}，时间倒退 {analysis.time_reversals} 次。"
+            f"自动节拍：中位 {baseline}，正常上沿 {upper}，"
+            f"断档阈值 {threshold}；以下帧协议参数对此文件不参与统计。"
+        )
         self.table.delete(*self.table.get_children())
         self.gaps = []
         self.cycle_results = []
@@ -1008,9 +1088,6 @@ class LossAnalyzerApp:
         self.populate_timestamp_evidence()
         self.populate_timestamp_windows(windows)
         self.populate_timestamp_comparisons()
-        baseline = f"{analysis.baseline_interval_ms:.1f} ms" if analysis.baseline_interval_ms is not None else "不足"
-        upper = f"{analysis.normal_upper_interval_ms:.1f} ms" if analysis.normal_upper_interval_ms is not None else "—"
-        threshold = f"{analysis.threshold_ms:.1f} ms" if analysis.threshold_ms is not None else "—"
         self.result.set(
             f"{self.direction_note}\n"
             f"时间断档模式：有效记录 {analysis.received}，字段数 {self.timestamp_table.field_count}，格式异常行 {self.timestamp_table.invalid_rows}，时间倒退 {analysis.time_reversals} 次。\n"
