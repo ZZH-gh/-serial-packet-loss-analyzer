@@ -503,11 +503,14 @@ class LossAnalyzerApp:
         finally:
             self.finish_operation()
         has_markers = self.direction_read.direction_markers_found
+        is_raw_receive = self.direction_read.raw_binary_receive
         rx_lines = len(self.direction_read.rx_chunks)
-        self.input_chunks = self.direction_read.rx_chunks if has_markers else self.direction_read.unknown_chunks
+        self.input_chunks = self.direction_read.rx_chunks if (has_markers or is_raw_receive) else self.direction_read.unknown_chunks
         self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
         self.direction_note = (
-            f"仅使用接收数据（RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
+            "检测到 SSCOM 原始二进制接收文件：已直接按 RX 字节流解析（文件本身不含 TX 记录）。"
+            if is_raw_receive
+            else f"仅使用接收数据（RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
             if has_markers
             else "日志未发现 TX/RX 方向标记：数据被标记为“方向未知”，暂按全部 HEX 数据分析。"
         )
@@ -548,14 +551,14 @@ class LossAnalyzerApp:
         self.notebook.select(self.preview_table.master)
 
     def credibility_summary(self, parsed, config: FrameConfig, cycle_model) -> dict:
-        direction_clear = bool(self.direction_read and self.direction_read.direction_markers_found)
+        direction_clear = bool(self.direction_read and (self.direction_read.direction_markers_found or self.direction_read.raw_binary_receive))
         total_checked = len(parsed.frames) + parsed.crc_errors + parsed.truncations
         crc_rate = parsed.crc_errors / total_checked if total_checked else None
         checks = {
             "parameter_source": self.parameter_source.get(),
             "previewed_current_parameters": self.preview_confirmed,
             "previewed_frames": self.preview_count,
-            "direction": "明确（仅RX）" if direction_clear else "未知（按全部HEX分析）",
+            "direction": "明确（原始二进制RX文件）" if self.direction_read and self.direction_read.raw_binary_receive else "明确（仅RX）" if direction_clear else "未知（按全部HEX分析）",
             "crc": "未启用" if config.crc is CrcKind.NONE else f"错误 {parsed.crc_errors}/{total_checked}",
             "cycle_evidence": (
                 "不适用（连续序号）" if cycle_model is None
@@ -657,7 +660,7 @@ class LossAnalyzerApp:
             try:
                 analysis = analyze_log(path, config, seq_offset, seq_size, endian, max_gap, coverage, manual_start, manual_count)
                 direction = analysis.direction_read
-                direction_text = f"{len(direction.rx_chunks)}/{len(direction.tx_chunks)}" if direction.direction_markers_found else "方向未知"
+                direction_text = "原始RX" if direction.raw_binary_receive else f"{len(direction.rx_chunks)}/{len(direction.tx_chunks)}" if direction.direction_markers_found else "方向未知"
                 included_cycles = [cycle for cycle in analysis.cycle_results if cycle.included]
                 worst_cycle = max(included_cycles, key=lambda cycle: cycle.missing / cycle.expected) if included_cycles else None
                 result = (
@@ -815,17 +818,20 @@ class LossAnalyzerApp:
                 raise ValueError("请先拖入或选择日志文件。")
             self.direction_read = read_directional_chunks(path, self.progress_callback("正在读取日志"))
             has_markers = self.direction_read.direction_markers_found
+            is_raw_receive = self.direction_read.raw_binary_receive
             rx_lines = len(self.direction_read.rx_chunks)
-            self.input_chunks = self.direction_read.rx_chunks if has_markers else self.direction_read.unknown_chunks
+            self.input_chunks = self.direction_read.rx_chunks if (has_markers or is_raw_receive) else self.direction_read.unknown_chunks
             self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
             self.direction_note = (
-                f"仅使用接收数据（SSCOM方向标签 {self.direction_read.native_sscom_markers} 行；RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
+                "检测到 SSCOM 原始二进制接收文件：已直接按 RX 字节流解析（文件本身不含 TX 记录）。"
+                if is_raw_receive
+                else f"仅使用接收数据（SSCOM方向标签 {self.direction_read.native_sscom_markers} 行；RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
                 if has_markers
                 else "日志未发现 TX/RX 方向标记：数据被标记为“方向未知”，暂按全部 HEX 数据分析。"
             )
             timeout = self.transaction_timeout_value()
             transaction = match_transactions(self.direction_read, timeout)
-            if transaction.sent or transaction.received:
+            if has_markers and (transaction.sent or transaction.received):
                 latency = f"，平均往返 {transaction.average_latency_ms:.1f} ms" if transaction.average_latency_ms is not None else ""
                 self.transaction_note = (
                     f"收发核对（不参与丢包率）：TX {transaction.sent}，RX {transaction.received}，按时间配对 {transaction.paired}，"
@@ -999,7 +1005,7 @@ class LossAnalyzerApp:
             + f"自检：{'已核对前 ' + str(credibility['checks']['previewed_frames']) + ' 帧' if credibility['checks']['previewed_current_parameters'] else '未完成'}；"
             + f"循环：{credibility['checks']['cycle_evidence']}。提示：{warning_text}。"
         )
-        transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read else None
+        transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read and self.direction_read.direction_markers_found else None
         file_bytes = path.read_bytes()
         self.last_report = {
             "format": "serial-loss-analysis-report", "version": 1,
@@ -1007,6 +1013,8 @@ class LossAnalyzerApp:
             "parameters": self.profile_values(),
             "direction": {
                 "markers_found": bool(self.direction_read and self.direction_read.direction_markers_found),
+                "raw_binary_capture": bool(self.direction_read and self.direction_read.raw_binary_capture),
+                "raw_binary_receive": bool(self.direction_read and self.direction_read.raw_binary_receive),
                 "rx_records": len(self.direction_read.rx_chunks) if self.direction_read else 0,
                 "tx_records": len(self.direction_read.tx_chunks) if self.direction_read else 0,
                 "unknown_records": len(self.direction_read.unknown_chunks) if self.direction_read else 0,

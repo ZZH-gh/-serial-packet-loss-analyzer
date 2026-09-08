@@ -89,6 +89,8 @@ class DirectionRead:
     records: list[LoggedChunk] = field(default_factory=list)
     direction_markers_found: bool = False
     native_sscom_markers: int = 0
+    raw_binary_capture: bool = False
+    raw_binary_receive: bool = False
 
     @property
     def direction_confidence(self) -> float:
@@ -223,7 +225,7 @@ def analyze_log(
     from frame_parser import parse_chunks
 
     direction_read = read_directional_chunks(path)
-    chunks = direction_read.rx_chunks if direction_read.direction_markers_found else direction_read.unknown_chunks
+    chunks = direction_read.rx_chunks if (direction_read.direction_markers_found or direction_read.raw_binary_receive) else direction_read.unknown_chunks
     parsed = parse_chunks(chunks, frame_config)
     sequences = [int.from_bytes(frame[sequence_offset : sequence_offset + sequence_size], endian) for frame in parsed.frames]
     if not sequences:
@@ -303,6 +305,20 @@ def _payload_bytes(body: bytes) -> bytes:
     return bytes(int(token, 16) for token in HEX_BYTE_RAW.findall(body))
 
 
+def _is_raw_binary_capture(sample: bytes) -> bool:
+    """Recognize SSCOM's direct 'receive to file' binary output.
+
+    A text export can contain non-ASCII direction glyphs, so high-bit bytes
+    alone are not a safe signal.  NUL/control-heavy content is, and lets raw
+    protocol frames bypass the text/HEX tokenizer completely.
+    """
+    if not sample:
+        return False
+    nul_ratio = sample.count(0) / len(sample)
+    control_ratio = sum(byte < 9 or 14 <= byte < 32 or byte == 127 for byte in sample) / len(sample)
+    return nul_ratio >= 0.01 or control_ratio >= 0.10
+
+
 def read_directional_chunks(
     path: Path, progress_callback: Callable[[int, int], bool] | None = None,
 ) -> DirectionRead:
@@ -316,8 +332,32 @@ def read_directional_chunks(
     from frame_parser import OperationCancelled, RxChunk
 
     result = DirectionRead()
-    active_direction: str | None = None
     total_bytes = path.stat().st_size
+    with path.open("rb") as source:
+        sample = source.read(min(total_bytes, 65536))
+    if _is_raw_binary_capture(sample):
+        # SSCOM names its direct receive saves ReceivedTofile-COMx-*.DAT.
+        # That filename is sufficient evidence to treat this raw byte stream
+        # as RX; other binary DAT files remain explicitly direction-unknown.
+        raw_receive = path.name.lower().startswith("receivedtofile")
+        direction = "rx" if raw_receive else "unknown"
+        raw = bytearray()
+        with path.open("rb") as source:
+            while block := source.read(65536):
+                raw.extend(block)
+                if progress_callback and not progress_callback(len(raw), total_bytes):
+                    raise OperationCancelled("log read cancelled by user")
+        chunk = RxChunk(bytes(raw), None, 1)
+        result.records.append(LoggedChunk(direction, chunk))
+        if raw_receive:
+            result.rx_chunks.append(chunk)
+        else:
+            result.unknown_chunks.append(chunk)
+        result.raw_binary_capture = True
+        result.raw_binary_receive = raw_receive
+        return result
+
+    active_direction: str | None = None
     consumed = 0
     with path.open("rb") as source:
         for line_no, raw_line in enumerate(source, start=1):
@@ -357,7 +397,7 @@ def read_receive_chunks(path: Path):
     remain usable; callers should display that limitation to the user.
     """
     parsed = read_directional_chunks(path)
-    if not parsed.direction_markers_found:
+    if not (parsed.direction_markers_found or parsed.raw_binary_receive):
         return parsed.unknown_chunks, False, 0
     return parsed.rx_chunks, True, len(parsed.rx_chunks)
 

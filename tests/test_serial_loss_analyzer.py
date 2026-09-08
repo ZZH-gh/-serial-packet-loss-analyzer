@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from frame_parser import FrameConfig, FrameEvidence, OperationCancelled, RxChunk
+from frame_parser import CrcKind, FrameConfig, FrameEvidence, FrameProtocol, OperationCancelled, RxChunk, crc16_modbus, parse_chunks
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
     analyze_log, detect_protocol, match_transactions, read_directional_chunks,
@@ -122,6 +122,19 @@ class SerialLogTests(unittest.TestCase):
     def test_protocol_detection_can_be_cancelled(self):
         with self.assertRaises(OperationCancelled):
             detect_protocol(b"\xAA\x55\x01" * 10, progress_callback=lambda _current, _total: False)
+
+    def test_sscom_receivedtofile_binary_dat_is_treated_as_rx_stream(self):
+        body = b"\x01\x03\x02\x00\x00"
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ReceivedTofile-COM7.DAT"
+            path.write_bytes(frame * 3)
+            result = read_directional_chunks(path)
+        self.assertTrue(result.raw_binary_capture)
+        self.assertTrue(result.raw_binary_receive)
+        self.assertEqual([chunk.data for chunk in result.rx_chunks], [frame * 3])
+        parsed = parse_chunks(result.rx_chunks, FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS))
+        self.assertEqual(parsed.frames, [frame, frame, frame])
 
 
 if __name__ == "__main__":
