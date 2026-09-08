@@ -820,19 +820,30 @@ def _modbus_key(data: bytes, is_request: bool) -> tuple[int, int, int | None] | 
     register count predicts the response byte-count.  Checking it prevents a
     response for a different read command from satisfying the oldest request.
     """
+    candidates: list[tuple[int, int, tuple[int, int, int | None]]] = []
     for index in range(max(0, len(data) - 1)):
         address, function = data[index], data[index + 1] & 0x7F
         if 1 <= address <= 247 and 1 <= function <= 0x7F:
             byte_count = None
+            confidence = 1
             if function in (0x03, 0x04):
                 if is_request and len(data) >= index + 6:
                     register_count = int.from_bytes(data[index + 4 : index + 6], "big")
                     if 1 <= register_count <= 125:
                         byte_count = register_count * 2
+                        confidence = 3
                 elif not is_request and len(data) >= index + 3:
                     byte_count = data[index + 2]
-            return address, function, byte_count
-    return None
+                    # A byte-count must be even for a 03/04 register reply.
+                    if byte_count and byte_count % 2 == 0:
+                        confidence = 3
+            candidates.append((confidence, -index, (address, function, byte_count)))
+    if not candidates:
+        return None
+    # Some SSCOM logs add transport bytes before the actual Modbus message.
+    # Prefer a complete 03/04 request/reply over an incidental byte pair in
+    # that wrapper, then prefer the earliest equally credible candidate.
+    return max(candidates)[2]
 
 
 def match_transactions(direction_read: DirectionRead, timeout_ms: int | None = 1500) -> TransactionSummary:

@@ -108,6 +108,18 @@ class SerialLogTests(unittest.TestCase):
         result = match_transactions(read)
         self.assertEqual((result.eligible_paired, result.eligible_unmatched, result.orphan_received), (0, 1, 1))
 
+    def test_modbus_transaction_matching_skips_sscom_transport_prefix(self):
+        now = datetime(1900, 1, 1, 12, 0, 0)
+        # FF FF 1E is an SSCOM/transport wrapper; 01 03 is the actual request.
+        tx = RxChunk(b"\xff\xff\x1e\x01\x03\x10\x00\x00\x1e\xc1\x02", now, 1)
+        rx = RxChunk(b"\x01\x03\x3c" + b"\x00" * 60, now + timedelta(milliseconds=50), 2)
+        read = DirectionRead(
+            tx_chunks=[tx], rx_chunks=[rx],
+            records=[LoggedChunk("tx", tx), LoggedChunk("rx", rx)], direction_markers_found=True,
+        )
+        result = match_transactions(read)
+        self.assertEqual((result.eligible_sent, result.eligible_paired, result.response_loss_percent), (1, 1, 0.0))
+
     def test_time_windows_locate_missing_sequence_and_long_interval(self):
         now = datetime(1900, 1, 1, 12, 0, 0)
         evidence = [
