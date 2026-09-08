@@ -669,22 +669,21 @@ def detect_protocol(
         for offset in range(len(header), frame_size - size + 1):
             for endian in ("little", "big"):
                 values = [int.from_bytes(frame[offset : offset + size], endian) for frame in captured]
-                modulus = 1 << (size * 8)
-                advances = [(right - left) % modulus for left, right in zip(values, values[1:])]
-                normal = sum(advance == 1 for advance in advances)
-                short_gap = sum(2 <= advance <= 32 for advance in advances)
-                duplicates = sum(advance == 0 for advance in advances)
-                field_score = normal + short_gap * 0.55 - duplicates * 0.25
-                if best_seq is None or field_score > best_seq[0]:
+                field_score = _credible_sequence_score(values, size)
+                if field_score is not None and (best_seq is None or field_score > best_seq[0]):
                     best_seq = (field_score, offset, size, endian)
     confidence = min(1.0, score / max(3, len(captured) - 1))
-    if best_seq is None or best_seq[0] < 2:
+    if best_seq is None:
         return Detection(header, frame_size, None, None, None, confidence)
     return Detection(header, frame_size, best_seq[1], best_seq[2], best_seq[3], confidence)
 
 
 def detect_sequence_field(captured: list[bytes]) -> tuple[int, int, str] | None:
-    """Suggest a monotonically increasing field from already extracted frames."""
+    """Suggest a *credible* sequence field from already extracted frames.
+
+    Measurement values often change gradually too. A few adjacent ``+1``
+    values are not enough: prefer no result over a fabricated loss rate.
+    """
     if len(captured) < 4:
         return None
     best: tuple[float, int, int, str] | None = None
@@ -693,17 +692,36 @@ def detect_sequence_field(captured: list[bytes]) -> tuple[int, int, str] | None:
         for offset in range(0, shortest - size + 1):
             for endian in ("little", "big"):
                 values = [int.from_bytes(frame[offset : offset + size], endian) for frame in captured]
-                modulus = 1 << (size * 8)
-                advances = [(right - left) % modulus for left, right in zip(values, values[1:])]
-                normal = sum(advance == 1 for advance in advances)
-                short_gap = sum(2 <= advance <= 32 for advance in advances)
-                duplicates = sum(advance == 0 for advance in advances)
-                score = normal + short_gap * 0.55 - duplicates * 0.25
-                if best is None or score > best[0]:
+                score = _credible_sequence_score(values, size)
+                if score is not None and (best is None or score > best[0]):
                     best = (score, offset, size, endian)
-    if best is None or best[0] < 2:
+    if best is None:
         return None
     return best[1], best[2], best[3]
+
+
+def _credible_sequence_score(values: list[int], size: int) -> float | None:
+    """Score a field only if it has counter-like adjacent transitions.
+
+    At least 80% of adjacent values must move forward by one or a small gap;
+    repeated and backwards values have independent caps. This rejects a slowly
+    changing measurement/register value while allowing occasional lost frames
+    and normal modulo wraps.
+    """
+    if len(values) < 4:
+        return None
+    modulus = 1 << (size * 8)
+    advances = [(right - left) % modulus for left, right in zip(values, values[1:])]
+    total = len(advances)
+    forward = sum(1 <= advance <= 32 for advance in advances)
+    normal = sum(advance == 1 for advance in advances)
+    repeats = sum(advance == 0 for advance in advances)
+    backwards = sum(advance >= modulus - 32 for advance in advances)
+    if forward / total < 0.80 or repeats / total > 0.15 or backwards / total > 0.10:
+        return None
+    if normal < 3:
+        return None
+    return normal * 2 + (forward - normal)
 
 
 def analyze_cycles(

@@ -10,11 +10,23 @@ from frame_parser import CrcKind, FrameConfig, FrameEvidence, FrameProtocol, Ope
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
     analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, detect_protocol,
-    detect_timestamp_table, match_transactions, read_directional_chunks,
+    detect_sequence_field, detect_timestamp_table, match_transactions, read_directional_chunks,
 )
 
 
 class SerialLogTests(unittest.TestCase):
+    def test_sequence_detector_rejects_slowly_varying_measurement_values(self):
+        # The changing byte looks locally smooth, but repeated and backwards
+        # values prove it is a measurement, not a packet counter.
+        readings = [47, 39, 38, 36, 38, 35, 35, 35, 34, 33, 33, 31, 32, 32, 31, 33] * 3
+        frames = [b"\x01\x03\x3c\x00\x02\x0a" + bytes([reading]) + b"\x00" * 58 for reading in readings]
+        self.assertIsNone(detect_sequence_field(frames))
+
+    def test_sequence_detector_accepts_counter_with_occasional_missing_values(self):
+        values = [1, 2, 4, 5, 6, 8, 9, 10, 11, 12]
+        frames = [b"\xaa\x55" + value.to_bytes(2, "little") + b"\x00" * 8 for value in values]
+        self.assertEqual(detect_sequence_field(frames), (2, 1, "little"))
+
     def test_sscom_native_labels_select_only_rx_and_ignore_timestamp_digits(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "capture.TXT"

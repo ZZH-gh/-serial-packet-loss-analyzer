@@ -12,7 +12,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, Toplevel, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, StringVar, Toplevel, filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -89,6 +89,7 @@ class LossAnalyzerApp:
         self.seq_offset = StringVar(value="2")
         self.seq_size = StringVar(value="2")
         self.endian = StringVar(value="little")
+        self.manual_sequence_confirmed = BooleanVar(value=False)
         self.max_gap = StringVar(value="1000")
         self.cycle_coverage = StringVar(value="50")
         self.transaction_timeout = StringVar(value="1500")
@@ -123,6 +124,7 @@ class LossAnalyzerApp:
         self.cancel_requested = False
         self._setting_parameters = False
         self._auto_display_mode: str | None = None
+        self._auto_sequence_signature: tuple[str, str, str] | None = None
         self._build()
         self._watch_parameters()
 
@@ -258,9 +260,13 @@ class LossAnalyzerApp:
             text="长度字段帧规则：总帧长 = 指定偏移处的长度字段值 + 调整值；固定总帧长在该模式下不使用。",
             style="Hint.TLabel",
         ).grid(row=((len(fields) + 3) // 4) * 2, column=0, columnspan=4, padx=4, sticky="w")
+        ttk.Checkbutton(
+            config, variable=self.manual_sequence_confirmed,
+            text="手动确认以上序号字段确为协议计数器（自动未识别时，勾选后才允许计算丢包率）",
+        ).grid(row=((len(fields) + 3) // 4) * 2 + 1, column=0, columnspan=4, padx=4, pady=(5, 0), sticky="w")
         ttk.Label(
             config, textvariable=self.rule_summary, justify="left", wraplength=1000, style="Verify.TLabel",
-        ).grid(row=((len(fields) + 3) // 4) * 2 + 1, column=0, columnspan=4, padx=4, pady=(8, 0), sticky="ew")
+        ).grid(row=((len(fields) + 3) // 4) * 2 + 2, column=0, columnspan=4, padx=4, pady=(8, 0), sticky="ew")
 
         buttons = ttk.Frame(outer, style="App.TFrame")
         buttons.pack(fill="x", pady=(14, 10))
@@ -532,6 +538,12 @@ class LossAnalyzerApp:
         self.primary_loss_detail.set(detail)
         style = "MetricGood.TLabel" if rate == 0 else "MetricWatch.TLabel" if rate <= 0.1 else "MetricAlert.TLabel"
         self.primary_loss_value.configure(style=style)
+
+    def set_primary_loss_unavailable(self, detail: str) -> None:
+        self.primary_loss.set("不适用")
+        self.primary_loss_label.set("未发现可信序号")
+        self.primary_loss_detail.set(detail)
+        self.primary_loss_value.configure(style="MetricWatch.TLabel")
 
     def analysis_setup(self):
         path = Path(self.file_path.get())
@@ -934,6 +946,8 @@ class LossAnalyzerApp:
         self.direction_read = None
         self.timestamp_table = None
         self.timestamp_gap_analysis = None
+        self._auto_sequence_signature = None
+        self.manual_sequence_confirmed.set(False)
         self.rule_summary.set("导入日志后，这里会显示当前文件实际识别到的格式与统计口径。")
         self.preview_button.configure(text="参数自检")
         self.table.delete(*self.table.get_children())
@@ -1006,8 +1020,10 @@ class LossAnalyzerApp:
                         self.seq_offset.set(str(suggested[0]))
                         self.seq_size.set(str(suggested[1]))
                         self.endian.set(suggested[2])
+                        self._auto_sequence_signature = (str(suggested[0]), str(suggested[1]), suggested[2])
                         sequence_text = f"候选序号偏移 {suggested[0]}、{suggested[1]} 字节、{suggested[2]}"
                     else:
+                        self._auto_sequence_signature = None
                         sequence_text = "未发现可信的递增序号字段"
                 finally:
                     self._setting_parameters = False
@@ -1034,8 +1050,10 @@ class LossAnalyzerApp:
                     self.seq_offset.set(str(detected.seq_offset))
                     self.seq_size.set(str(detected.seq_size))
                     self.endian.set(detected.endian or "little")
+                    self._auto_sequence_signature = (str(detected.seq_offset), str(detected.seq_size), detected.endian or "little")
                     sequence_text = f"序号偏移 {detected.seq_offset}、{detected.seq_size} 字节、{detected.endian}"
                 else:
+                    self._auto_sequence_signature = None
                     sequence_text = "未能可靠识别序号字段，请手动填写"
             finally:
                 self._setting_parameters = False
@@ -1210,6 +1228,14 @@ class LossAnalyzerApp:
             self.ensure_input_chunks(path)
             parsed = self.parse_with_progress(config, "正在验证完整帧")
             captured = parsed.frames
+            current_sequence_signature = (str(seq_offset), str(seq_size), self.endian.get())
+            sequence_allowed = (
+                self._auto_sequence_signature == current_sequence_signature
+                or self.manual_sequence_confirmed.get()
+            )
+            if not sequence_allowed:
+                self.show_sequence_unavailable(parsed, captured)
+                return
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
                 raise ValueError("没有找到完整帧。请检查帧头和总帧长。")
@@ -1353,6 +1379,25 @@ class LossAnalyzerApp:
         self.export_button.configure(state="normal")
         self.evidence_export_button.configure(state="normal")
         self.report_export_button.configure(state="normal")
+
+    def show_sequence_unavailable(self, parsed, captured: list[bytes]) -> None:
+        """Present frame-integrity evidence without fabricating a loss rate."""
+        self.table.delete(*self.table.get_children())
+        self.set_table_headings((("after", "有效完整帧"), ("first", "CRC错误"), ("last", "截断"), ("count", "噪声字节")))
+        self.table.insert("", END, values=(len(captured), parsed.crc_errors, parsed.truncations, parsed.noise_bytes))
+        detail = "当前帧内没有可信递增序号；原始 RX 文件也没有时间戳，不能从已收到的帧反推出整帧漏收。"
+        self.set_primary_loss_unavailable(detail)
+        self.result.set(
+            f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n"
+            "未发现可信递增序号：不计算丢包率，避免把测量值波动误判为漏包。"
+            "若协议确有序号，请填写正确偏移/字节数并勾选“手动确认以上序号字段”。"
+        )
+        self.evidence.delete(*self.evidence.get_children())
+        self.evidence_rows = []
+        self.last_report = None
+        self.export_button.configure(state="disabled")
+        self.evidence_export_button.configure(state="disabled")
+        self.report_export_button.configure(state="disabled")
 
     def export(self) -> None:
         filename = filedialog.asksaveasfilename(
