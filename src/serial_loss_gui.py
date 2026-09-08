@@ -16,7 +16,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, Toplevel, filedia
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from frame_parser import CrcKind, FrameConfig, FrameProtocol, parse_chunks
+from frame_parser import CrcKind, FrameConfig, FrameProtocol, OperationCancelled, parse_chunks
 from serial_loss_analyzer import (
     CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, detect_modbus_rtu,
     detect_protocol, detect_sequence_field, match_transactions, parse_hex, read_directional_chunks,
@@ -96,6 +96,9 @@ class LossAnalyzerApp:
         self.time_window_seconds = StringVar(value="60")
         self.crc = StringVar(value=CrcKind.NONE.value)
         self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV/DAT 文件，或点击“选择日志文件”。")
+        self.parameter_source = StringVar(value="默认参数（尚未自检）")
+        self.preview_note = StringVar(value="点击“参数自检”后，这里会显示当前参数切出的前 10 帧。")
+        self.progress_message = StringVar(value="")
         self.gaps: list[Gap] = []
         self.cycle_results: list[CycleResult] = []
         self.cyclic_mode = False
@@ -108,7 +111,12 @@ class LossAnalyzerApp:
         self.last_report: dict | None = None
         self.compare_paths: list[Path] = []
         self.comparison_rows: list[dict[str, str]] = []
+        self.preview_confirmed = False
+        self.preview_count = 0
+        self.cancel_requested = False
+        self._setting_parameters = False
         self._build()
+        self._watch_parameters()
 
     def _build(self) -> None:
         style = ttk.Style()
@@ -134,6 +142,8 @@ class LossAnalyzerApp:
         style.configure("Export.TButton", background="#FFF0D3", foreground="#8A5400", borderwidth=0, padding=(11, 8))
         style.map("Export.TButton", background=[("active", "#FFE0A8"), ("disabled", "#E7EDEF")])
         style.configure("Status.TLabel", background="#F9FCFD", foreground="#27485C", relief="solid", borderwidth=1, padding=10, font=("Microsoft YaHei UI", 9))
+        style.configure("Verify.TLabel", background="#E1F1EF", foreground="#075D67", relief="solid", borderwidth=1, padding=9, font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Progress.TLabel", background="#EAF1F5", foreground="#426176", font=("Microsoft YaHei UI", 8))
         style.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#18324A", rowheight=30, bordercolor="#C4D5DF", font=("Consolas", 9))
         style.configure("Treeview.Heading", background="#DCEAF0", foreground="#164A62", relief="flat", font=("Microsoft YaHei UI", 9, "bold"), padding=(7, 7))
         style.map("Treeview", background=[("selected", "#BDEAE5")], foreground=[("selected", "#102A43")])
@@ -248,8 +258,12 @@ class LossAnalyzerApp:
 
         buttons = ttk.Frame(outer, style="App.TFrame")
         buttons.pack(fill="x", pady=(14, 10))
-        ttk.Button(buttons, text="自动识别", command=self.auto_detect, style="Secondary.TButton").pack(side=LEFT)
-        ttk.Button(buttons, text="开始统计", command=self.analyze, style="Primary.TButton").pack(side=LEFT, padx=(8, 18))
+        self.auto_button = ttk.Button(buttons, text="自动识别", command=self.auto_detect, style="Secondary.TButton")
+        self.auto_button.pack(side=LEFT)
+        self.preview_button = ttk.Button(buttons, text="参数自检", command=self.preview_parameters, style="Secondary.TButton")
+        self.preview_button.pack(side=LEFT, padx=(8, 0))
+        self.analyze_button = ttk.Button(buttons, text="开始统计", command=self.analyze, style="Primary.TButton")
+        self.analyze_button.pack(side=LEFT, padx=(8, 18))
         ttk.Button(buttons, text="保存方案", command=self.save_profile, style="Secondary.TButton").pack(side=LEFT)
         ttk.Button(buttons, text="加载方案", command=self.load_profile, style="Secondary.TButton").pack(side=LEFT, padx=(4, 14))
         self.export_button = ttk.Button(buttons, text="导出缺失 CSV", command=self.export, state="disabled", style="Export.TButton")
@@ -260,16 +274,25 @@ class LossAnalyzerApp:
         self.report_export_button.pack(side=LEFT, padx=(4, 0))
         self.comparison_export_button = ttk.Button(buttons, text="导出对比 CSV", command=self.export_comparison, state="disabled", style="Export.TButton")
         self.comparison_export_button.pack(side=LEFT, padx=(4, 0))
+        progress_row = ttk.Frame(outer, style="App.TFrame")
+        progress_row.pack(fill="x", pady=(0, 10))
+        self.operation_progress = ttk.Progressbar(progress_row, orient="horizontal", mode="determinate", maximum=100)
+        self.operation_progress.pack(side=LEFT, fill="x", expand=True)
+        ttk.Label(progress_row, textvariable=self.progress_message, style="Progress.TLabel").pack(side=LEFT, padx=(8, 4))
+        self.cancel_button = ttk.Button(progress_row, text="取消", command=self.request_cancel, state="disabled", style="Secondary.TButton")
+        self.cancel_button.pack(side=RIGHT)
 
         ttk.Label(outer, text="03  分析结果", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel").pack(fill="x", pady=(0, 10))
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill=BOTH, expand=True)
         table_frame = ttk.Frame(self.notebook)
+        preview_frame = ttk.Frame(self.notebook)
         evidence_frame = ttk.Frame(self.notebook)
         time_frame = ttk.Frame(self.notebook)
         comparison_frame = ttk.Frame(self.notebook)
         self.notebook.add(table_frame, text="统计明细")
+        self.notebook.add(preview_frame, text="参数自检")
         self.notebook.add(evidence_frame, text="解析证据")
         self.notebook.add(time_frame, text="时间定位")
         self.notebook.add(comparison_frame, text="多文件对比")
@@ -284,6 +307,22 @@ class LossAnalyzerApp:
         self.table.configure(yscrollcommand=scroll.set)
         self.table.pack(side=LEFT, fill=BOTH, expand=True)
         scroll.pack(side=RIGHT, fill="y")
+
+        ttk.Label(preview_frame, textvariable=self.preview_note, justify="left", wraplength=1000, style="Verify.TLabel").pack(fill="x", padx=1, pady=(0, 8))
+        self.preview_table = ttk.Treeview(
+            preview_frame, columns=("frame", "lines", "time", "bytes", "sequence", "check"),
+            show="headings", height=10,
+        )
+        for key, text, width in (
+            ("frame", "预览帧", 75), ("lines", "日志行", 85), ("time", "接收时间", 110),
+            ("bytes", "按当前参数切出的完整帧", 360), ("sequence", "当前序号字段", 120), ("check", "核对结果", 220),
+        ):
+            self.preview_table.heading(key, text=text)
+            self.preview_table.column(key, width=width, anchor="w", stretch=key in {"bytes", "check"})
+        preview_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_table.yview)
+        self.preview_table.configure(yscrollcommand=preview_scroll.set)
+        self.preview_table.pack(side=LEFT, fill=BOTH, expand=True)
+        preview_scroll.pack(side=RIGHT, fill="y")
 
         self.evidence = ttk.Treeview(
             evidence_frame,
@@ -325,6 +364,196 @@ class LossAnalyzerApp:
         self.comparison_table.configure(yscrollcommand=comparison_scroll.set)
         self.comparison_table.pack(side=LEFT, fill=BOTH, expand=True)
         comparison_scroll.pack(side=RIGHT, fill="y")
+
+    def _watch_parameters(self) -> None:
+        for variable in (
+            self.profile, self.header, self.frame_size, self.length_offset, self.length_size,
+            self.length_endian, self.length_adjust, self.seq_offset, self.seq_size, self.endian,
+            self.max_gap, self.crc, self.cycle_coverage, self.transaction_timeout,
+            self.manual_cycle_start, self.manual_cycle_count, self.time_window_seconds,
+        ):
+            variable.trace_add("write", self._on_parameter_change)
+
+    def _on_parameter_change(self, *_args) -> None:
+        if self._setting_parameters:
+            return
+        self.parameter_source.set("人工调整（请重新自检）")
+        self.invalidate_preview()
+
+    def invalidate_preview(self) -> None:
+        self.preview_confirmed = False
+        self.preview_count = 0
+        self.preview_note.set("参数已变更；请点击“参数自检”，核对当前帧头、帧长和序号字段。")
+        self.preview_table.delete(*self.preview_table.get_children())
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+        self.progress_message.set("正在取消…")
+        self.cancel_button.configure(state="disabled")
+
+    def begin_operation(self, message: str) -> None:
+        self.cancel_requested = False
+        self.operation_progress.configure(value=0)
+        self.progress_message.set(message)
+        self.cancel_button.configure(state="normal")
+        self.auto_button.configure(state="disabled")
+        self.analyze_button.configure(state="disabled")
+        self.preview_button.configure(state="disabled")
+        self.root.update_idletasks()
+
+    def progress_callback(self, message: str):
+        def update(current: int, total: int) -> bool:
+            percent = 100 if total <= 0 else min(100, current * 100 / total)
+            self.operation_progress.configure(value=percent)
+            self.progress_message.set(f"{message} {percent:.0f}%（可取消）")
+            # Process the Cancel click while parsing remains on this thread.
+            self.root.update_idletasks()
+            self.root.update()
+            return not self.cancel_requested
+        return update
+
+    def finish_operation(self) -> None:
+        self.operation_progress.configure(value=0)
+        self.progress_message.set("")
+        self.cancel_button.configure(state="disabled")
+        self.auto_button.configure(state="normal")
+        self.analyze_button.configure(state="normal")
+        self.preview_button.configure(state="normal")
+
+    def analysis_setup(self):
+        path = Path(self.file_path.get())
+        if not path.is_file():
+            raise ValueError("请先拖入或选择日志文件。")
+        is_modbus = self.profile.get().startswith("Modbus")
+        is_length_field = self.profile.get() == "自定义长度字段帧"
+        header = b"" if is_modbus else parse_hex(self.header.get())
+        frame_size = None if (is_modbus or is_length_field) else int(self.frame_size.get())
+        length_offset = int(self.length_offset.get()) if is_length_field else None
+        length_size = int(self.length_size.get()) if is_length_field else 1
+        length_adjust = int(self.length_adjust.get()) if is_length_field else 0
+        seq_offset = int(self.seq_offset.get())
+        seq_size = int(self.seq_size.get())
+        max_gap = int(self.max_gap.get())
+        time_window = int(self.time_window_seconds.get())
+        coverage = float(self.cycle_coverage.get()) / 100
+        self.transaction_timeout_value()
+        manual_start, manual_count = self.manual_cycle_values()
+        if not is_modbus and not is_length_field and frame_size <= len(header):
+            raise ValueError("总帧长必须大于帧头长度。")
+        if is_length_field and (length_offset is None or length_offset < 0 or length_size not in (1, 2, 4)):
+            raise ValueError("请填写有效的长度字段偏移和字节数（1、2 或 4）。")
+        if seq_offset < 0 or (frame_size is not None and seq_offset + seq_size > frame_size):
+            raise ValueError("序号字段超出帧范围。")
+        if max_gap < 0:
+            raise ValueError("帧内超时不能小于 0。")
+        if time_window < 1 or time_window > 3600:
+            raise ValueError("时间统计窗口必须在 1 到 3600 秒之间。")
+        if not 0 < coverage <= 1:
+            raise ValueError("循环纳入阈值必须在 0 到 100 之间。")
+        config = (
+            FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS, max_frame_gap_ms=max_gap or None)
+            if is_modbus
+            else FrameConfig(
+                header, fixed_length=frame_size, length_offset=length_offset, length_size=length_size,
+                length_endian=self.length_endian.get(), length_adjust=length_adjust,
+                crc=CrcKind(self.crc.get()), max_frame_gap_ms=max_gap or None,
+            )
+        )
+        return path, config, seq_offset, seq_size, max_gap, time_window, coverage, manual_start, manual_count
+
+    def ensure_input_chunks(self, path: Path) -> None:
+        if self.input_chunks:
+            return
+        self.begin_operation("正在读取并识别收发方向")
+        try:
+            self.direction_read = read_directional_chunks(path, self.progress_callback("正在读取日志"))
+        finally:
+            self.finish_operation()
+        has_markers = self.direction_read.direction_markers_found
+        rx_lines = len(self.direction_read.rx_chunks)
+        self.input_chunks = self.direction_read.rx_chunks if has_markers else self.direction_read.unknown_chunks
+        self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
+        self.direction_note = (
+            f"仅使用接收数据（RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
+            if has_markers
+            else "日志未发现 TX/RX 方向标记：数据被标记为“方向未知”，暂按全部 HEX 数据分析。"
+        )
+
+    def parse_with_progress(self, config: FrameConfig, message: str):
+        self.begin_operation(message)
+        try:
+            return parse_chunks(self.input_chunks, config, self.progress_callback(message))
+        finally:
+            self.finish_operation()
+
+    def preview_parameters(self) -> None:
+        try:
+            path, config, seq_offset, seq_size, *_rest = self.analysis_setup()
+            self.ensure_input_chunks(path)
+            parsed = self.parse_with_progress(config, "正在按当前参数自检")
+            if not parsed.frames:
+                raise ValueError("当前规则没有切出完整帧；请检查帧头、帧长或长度字段。")
+        except OperationCancelled:
+            self.preview_note.set("参数自检已取消；当前结果未更新。")
+            return
+        except (OSError, ValueError) as error:
+            messagebox.showerror("无法自检", str(error))
+            return
+        self.preview_table.delete(*self.preview_table.get_children())
+        for index, (evidence, frame) in enumerate(zip(parsed.frame_evidence[:10], parsed.frames[:10]), start=1):
+            sequence_bytes = frame[seq_offset : seq_offset + seq_size]
+            sequence = int.from_bytes(sequence_bytes, self.endian.get()) if len(sequence_bytes) == seq_size else None
+            lines = str(evidence.first_line_no) if evidence.last_line_no == evidence.first_line_no else f"{evidence.first_line_no}→{evidence.last_line_no}"
+            timestamp = evidence.first_timestamp.strftime("%H:%M:%S.%f")[:-3] if evidence.first_timestamp else "—"
+            check = "完整帧" + ("；CRC通过" if config.crc is not CrcKind.NONE else "；未启用CRC")
+            self.preview_table.insert("", END, values=(index, lines, timestamp, frame.hex(" ").upper(), sequence if sequence is not None else "序号超出帧长", check))
+        self.preview_confirmed = True
+        self.preview_count = min(10, len(parsed.frames))
+        self.preview_note.set(
+            f"已按当前参数自检 {self.preview_count} 帧：完整帧 {len(parsed.frames)}，CRC错误 {parsed.crc_errors}，截断 {parsed.truncations}，噪声 {parsed.noise_bytes} 字节。请逐行确认帧内容与序号字段。"
+        )
+        self.notebook.select(self.preview_table.master)
+
+    def credibility_summary(self, parsed, config: FrameConfig, cycle_model) -> dict:
+        direction_clear = bool(self.direction_read and self.direction_read.direction_markers_found)
+        total_checked = len(parsed.frames) + parsed.crc_errors + parsed.truncations
+        crc_rate = parsed.crc_errors / total_checked if total_checked else None
+        checks = {
+            "parameter_source": self.parameter_source.get(),
+            "previewed_current_parameters": self.preview_confirmed,
+            "previewed_frames": self.preview_count,
+            "direction": "明确（仅RX）" if direction_clear else "未知（按全部HEX分析）",
+            "crc": "未启用" if config.crc is CrcKind.NONE else f"错误 {parsed.crc_errors}/{total_checked}",
+            "cycle_evidence": (
+                "不适用（连续序号）" if cycle_model is None
+                else "使用者手动设定" if cycle_model.evidence_cycles == 0
+                else f"{cycle_model.evidence_cycles} 个宽范围循环共同证实"
+            ),
+        }
+        warnings = []
+        score = 0
+        if direction_clear:
+            score += 1
+        else:
+            warnings.append("未识别TX/RX方向，统计包含方向未知数据")
+        if self.preview_confirmed:
+            score += 1
+        else:
+            warnings.append("尚未在当前参数下完成自检预览")
+        if config.crc is CrcKind.NONE:
+            warnings.append("未启用CRC，帧完整性只能按帧头和长度判断")
+        elif parsed.crc_errors == 0:
+            score += 1
+        else:
+            warnings.append(f"发现 {parsed.crc_errors} 条CRC错误帧")
+        if parsed.truncations:
+            warnings.append(f"发现 {parsed.truncations} 处截断")
+        else:
+            score += 1
+        if cycle_model is not None and cycle_model.evidence_cycles >= 2:
+            score += 1
+        level = "较高" if score >= 4 and not warnings else "中等" if score >= 2 else "需复核"
+        return {"level": level, "checks": checks, "warnings": warnings}
 
     def set_table_headings(self, headings) -> None:
         for key, text in headings:
@@ -450,18 +679,24 @@ class LossAnalyzerApp:
             values = document.get("parameters") if isinstance(document, dict) else None
             if not isinstance(document, dict) or document.get("format") != "serial-loss-profile" or not isinstance(values, dict):
                 raise ValueError("不是本工具导出的协议方案。")
-            for key, variable in (
-                ("profile", self.profile), ("header", self.header), ("frame_size", self.frame_size),
-                ("length_offset", self.length_offset), ("length_size", self.length_size),
-                ("length_endian", self.length_endian), ("length_adjust", self.length_adjust),
-                ("seq_offset", self.seq_offset), ("seq_size", self.seq_size), ("endian", self.endian),
-                ("max_gap", self.max_gap), ("crc", self.crc), ("cycle_coverage", self.cycle_coverage),
-                ("transaction_timeout", self.transaction_timeout), ("manual_cycle_start", self.manual_cycle_start),
-                ("manual_cycle_count", self.manual_cycle_count), ("time_window_seconds", self.time_window_seconds),
-            ):
-                if key in values:
-                    variable.set(str(values[key]))
-            messagebox.showinfo("方案已加载", "协议参数已加载；请拖入日志后点击“开始统计”。")
+            self._setting_parameters = True
+            try:
+                for key, variable in (
+                    ("profile", self.profile), ("header", self.header), ("frame_size", self.frame_size),
+                    ("length_offset", self.length_offset), ("length_size", self.length_size),
+                    ("length_endian", self.length_endian), ("length_adjust", self.length_adjust),
+                    ("seq_offset", self.seq_offset), ("seq_size", self.seq_size), ("endian", self.endian),
+                    ("max_gap", self.max_gap), ("crc", self.crc), ("cycle_coverage", self.cycle_coverage),
+                    ("transaction_timeout", self.transaction_timeout), ("manual_cycle_start", self.manual_cycle_start),
+                    ("manual_cycle_count", self.manual_cycle_count), ("time_window_seconds", self.time_window_seconds),
+                ):
+                    if key in values:
+                        variable.set(str(values[key]))
+            finally:
+                self._setting_parameters = False
+            self.parameter_source.set("已加载方案（请重新自检）")
+            self.invalidate_preview()
+            messagebox.showinfo("方案已加载", "协议参数已加载；请先点“参数自检”核对，再开始统计。")
         except (OSError, ValueError, json.JSONDecodeError) as error:
             messagebox.showerror("无法加载方案", str(error))
 
@@ -528,6 +763,7 @@ class LossAnalyzerApp:
         self.evidence.delete(*self.evidence.get_children())
         self.time_table.delete(*self.time_table.get_children())
         self.comparison_table.delete(*self.comparison_table.get_children())
+        self.invalidate_preview()
         self.evidence_rows = []
         self.comparison_rows = []
         self.last_report = None
@@ -538,11 +774,12 @@ class LossAnalyzerApp:
         self.auto_detect(silent=True)
 
     def auto_detect(self, silent: bool = False) -> None:
+        self.begin_operation("正在读取并自动识别")
         try:
             path = Path(self.file_path.get())
             if not path.is_file():
                 raise ValueError("请先拖入或选择日志文件。")
-            self.direction_read = read_directional_chunks(path)
+            self.direction_read = read_directional_chunks(path, self.progress_callback("正在读取日志"))
             has_markers = self.direction_read.direction_markers_found
             rx_lines = len(self.direction_read.rx_chunks)
             self.input_chunks = self.direction_read.rx_chunks if has_markers else self.direction_read.unknown_chunks
@@ -563,105 +800,77 @@ class LossAnalyzerApp:
                 )
             else:
                 self.transaction_note = ""
-            modbus = detect_modbus_rtu(self.input_chunks)
+            modbus = detect_modbus_rtu(self.input_chunks, self.progress_callback("正在验证 Modbus 帧"))
             if modbus is not None:
                 captured, parsed = modbus
                 suggested = detect_sequence_field(captured)
-                self.profile.set("Modbus RTU（CRC自动帧长）")
-                self.header.set("任意站号 + 功能码")
-                self.frame_size.set("自动")
-                self.crc.set(CrcKind.MODBUS.value)
-                if suggested:
-                    self.seq_offset.set(str(suggested[0]))
-                    self.seq_size.set(str(suggested[1]))
-                    self.endian.set(suggested[2])
-                    sequence_text = f"候选序号偏移 {suggested[0]}、{suggested[1]} 字节、{suggested[2]}"
-                else:
-                    sequence_text = "未发现可信的递增序号字段"
+                self._setting_parameters = True
+                try:
+                    self.profile.set("Modbus RTU（CRC自动帧长）")
+                    self.header.set("任意站号 + 功能码")
+                    self.frame_size.set("自动")
+                    self.crc.set(CrcKind.MODBUS.value)
+                    if suggested:
+                        self.seq_offset.set(str(suggested[0]))
+                        self.seq_size.set(str(suggested[1]))
+                        self.endian.set(suggested[2])
+                        sequence_text = f"候选序号偏移 {suggested[0]}、{suggested[1]} 字节、{suggested[2]}"
+                    else:
+                        sequence_text = "未发现可信的递增序号字段"
+                finally:
+                    self._setting_parameters = False
+                self.parameter_source.set("自动识别候选（请自检）")
+                self.invalidate_preview()
                 self.result.set(
                     f"已验证为 Modbus RTU：{len(captured)} 条完整帧全部经 CRC16-Modbus 校验；{sequence_text}。\n"
                     f"{self.direction_note}\n{self.transaction_note}\n请核对序号字段后点击“开始统计”。"
                 )
                 return
-            detected = detect_protocol(self.input_stream)
+            detected = detect_protocol(self.input_stream, self.progress_callback("正在推断固定帧"))
             if detected is None:
                 raise ValueError("日志数据不足，或未找到间距稳定的固定长度帧。")
-            self.header.set(detected.header.hex().upper())
-            self.frame_size.set(str(detected.frame_size))
-            if detected.seq_offset is not None:
-                self.seq_offset.set(str(detected.seq_offset))
-                self.seq_size.set(str(detected.seq_size))
-                self.endian.set(detected.endian or "little")
-                sequence_text = f"序号偏移 {detected.seq_offset}、{detected.seq_size} 字节、{detected.endian}"
-            else:
-                sequence_text = "未能可靠识别序号字段，请手动填写"
+            self._setting_parameters = True
+            try:
+                self.header.set(detected.header.hex().upper())
+                self.frame_size.set(str(detected.frame_size))
+                if detected.seq_offset is not None:
+                    self.seq_offset.set(str(detected.seq_offset))
+                    self.seq_size.set(str(detected.seq_size))
+                    self.endian.set(detected.endian or "little")
+                    sequence_text = f"序号偏移 {detected.seq_offset}、{detected.seq_size} 字节、{detected.endian}"
+                else:
+                    sequence_text = "未能可靠识别序号字段，请手动填写"
+            finally:
+                self._setting_parameters = False
+            self.parameter_source.set("自动识别候选（请自检）")
+            self.invalidate_preview()
             self.result.set(
                 f"已自动识别：帧头 {detected.header.hex(' ').upper()}，总帧长 {detected.frame_size} 字节；{sequence_text}。\n"
                 f"{self.direction_note} 间距置信度 {detected.confidence:.0%}；请核对后点击“开始统计”。\n{self.transaction_note}"
             )
+        except OperationCancelled:
+            self.result.set("自动识别已取消；当前参数未改变。")
         except (OSError, ValueError) as error:
             if not silent:
                 messagebox.showwarning("无法自动识别", str(error))
             elif self.file_path.get():
                 self.result.set("已加载：%s\n未能自动识别协议，请手动填写参数后统计。" % path.name)
+        finally:
+            self.finish_operation()
 
     def analyze(self) -> None:
         try:
-            path = Path(self.file_path.get())
-            if not path.is_file():
-                raise ValueError("请先拖入或选择日志文件。")
-            is_modbus = self.profile.get().startswith("Modbus")
-            is_length_field = self.profile.get() == "自定义长度字段帧"
-            header = b"" if is_modbus else parse_hex(self.header.get())
-            frame_size = None if (is_modbus or is_length_field) else int(self.frame_size.get())
-            length_offset = int(self.length_offset.get()) if is_length_field else None
-            length_size = int(self.length_size.get()) if is_length_field else 1
-            length_adjust = int(self.length_adjust.get()) if is_length_field else 0
-            seq_offset = int(self.seq_offset.get())
-            seq_size = int(self.seq_size.get())
-            max_gap = int(self.max_gap.get())
-            time_window = int(self.time_window_seconds.get())
-            coverage = float(self.cycle_coverage.get()) / 100
-            self.transaction_timeout_value()
-            manual_start, manual_count = self.manual_cycle_values()
-            if not is_modbus and not is_length_field and frame_size <= len(header):
-                raise ValueError("总帧长必须大于帧头长度。")
-            if is_length_field and (length_offset is None or length_offset < 0 or length_size not in (1, 2, 4)):
-                raise ValueError("请填写有效的长度字段偏移和字节数（1、2 或 4）。")
-            if seq_offset < 0 or (frame_size is not None and seq_offset + seq_size > frame_size):
-                raise ValueError("序号字段超出帧范围。")
-            if max_gap < 0:
-                raise ValueError("帧内超时不能小于 0。")
-            if time_window < 1 or time_window > 3600:
-                raise ValueError("时间统计窗口必须在 1 到 3600 秒之间。")
-            if not 0 < coverage <= 1:
-                raise ValueError("循环纳入阈值必须在 0 到 100 之间。")
-            if not self.input_chunks:
-                self.direction_read = read_directional_chunks(path)
-                has_markers = self.direction_read.direction_markers_found
-                rx_lines = len(self.direction_read.rx_chunks)
-                self.input_chunks = self.direction_read.rx_chunks if has_markers else self.direction_read.unknown_chunks
-                self.input_stream = b"".join(chunk.data for chunk in self.input_chunks)
-                self.direction_note = (
-                    f"仅使用接收数据（RX {rx_lines}，TX {len(self.direction_read.tx_chunks)}；方向置信度 {self.direction_read.direction_confidence:.0%}）。"
-                    if has_markers
-                    else "日志未发现 TX/RX 方向标记：数据被标记为“方向未知”，暂按全部 HEX 数据分析。"
-                )
-            config = (
-                FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS, max_frame_gap_ms=max_gap or None)
-                if is_modbus
-                else FrameConfig(
-                    header, fixed_length=frame_size, length_offset=length_offset, length_size=length_size,
-                    length_endian=self.length_endian.get(), length_adjust=length_adjust,
-                    crc=CrcKind(self.crc.get()), max_frame_gap_ms=max_gap or None,
-                )
-            )
-            parsed = parse_chunks(self.input_chunks, config)
+            path, config, seq_offset, seq_size, max_gap, time_window, coverage, manual_start, manual_count = self.analysis_setup()
+            self.ensure_input_chunks(path)
+            parsed = self.parse_with_progress(config, "正在验证完整帧")
             captured = parsed.frames
             sequences = [int.from_bytes(frame[seq_offset : seq_offset + seq_size], self.endian.get()) for frame in captured]
             if not sequences:
                 raise ValueError("没有找到完整帧。请检查帧头和总帧长。")
             cyclic = analyze_cycles(sequences, coverage, manual_start, manual_count)
+        except OperationCancelled:
+            self.result.set("统计已取消；未覆盖上一份统计结果。")
+            return
         except (OSError, ValueError) as error:
             messagebox.showerror("无法统计", str(error))
             return
@@ -670,6 +879,7 @@ class LossAnalyzerApp:
         self.cycle_results = []
         self.gaps = []
         self.cyclic_mode = cyclic is not None
+        cycle_model = cyclic[0] if cyclic is not None else None
         analysis_stats = {}
         if cyclic is not None:
             model, self.cycle_results = cyclic
@@ -739,6 +949,14 @@ class LossAnalyzerApp:
             self.result.set(self.result.get() + f"\n时间定位：{baseline_text}；最需关注 {worst.start.strftime('%H:%M:%S')}，丢包 {worst.loss_percent:.2f}%，异常长间隔 {worst.long_intervals} 次。")
         else:
             self.result.set(self.result.get() + "\n时间定位：日志缺少可用时间戳，无法按时间段统计。")
+        credibility = self.credibility_summary(parsed, config, cycle_model)
+        warning_text = "；".join(credibility["warnings"]) if credibility["warnings"] else "未发现方向、完整性或自检告警"
+        self.result.set(
+            self.result.get()
+            + f"\n可信度摘要：{credibility['level']}。方向：{credibility['checks']['direction']}；参数：{credibility['checks']['parameter_source']}；"
+            + f"自检：{'已核对前 ' + str(credibility['checks']['previewed_frames']) + ' 帧' if credibility['checks']['previewed_current_parameters'] else '未完成'}；"
+            + f"循环：{credibility['checks']['cycle_evidence']}。提示：{warning_text}。"
+        )
         transaction = match_transactions(self.direction_read, self.transaction_timeout_value()) if self.direction_read else None
         file_bytes = path.read_bytes()
         self.last_report = {
@@ -758,6 +976,7 @@ class LossAnalyzerApp:
                 "events": [{"kind": event.kind, "received": event.received, "expected": event.expected, "detail": event.detail} for event in parsed.events],
             },
             "statistics": analysis_stats,
+            "credibility": credibility,
             "time_statistics": {
                 "window_seconds": time_window, "baseline_interval_ms": interval_baseline,
                 "windows": [{

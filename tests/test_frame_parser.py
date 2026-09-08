@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from frame_parser import CrcKind, FrameConfig, FrameProtocol, RxChunk, crc16_modbus, parse_chunks
+from frame_parser import CrcKind, FrameConfig, FrameProtocol, OperationCancelled, RxChunk, crc16_modbus, parse_chunks
 
 
 class FrameParserTests(unittest.TestCase):
@@ -60,6 +60,14 @@ class FrameParserTests(unittest.TestCase):
             FrameConfig(b"\xAA\x55", length_offset=2, length_size=1, length_endian="little", length_adjust=3),
         )
         self.assertEqual(result.frames, [frame])
+
+    def test_parse_can_be_cancelled_between_serial_records(self):
+        with self.assertRaises(OperationCancelled):
+            parse_chunks(
+                [RxChunk(b"\xAA\x55\x01"), RxChunk(b"\xAA\x55\x02")],
+                FrameConfig(b"\xAA\x55", fixed_length=3),
+                progress_callback=lambda _current, _total: False,
+            )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Callable
+
+
+class OperationCancelled(RuntimeError):
+    """Raised when a GUI caller asks a long parsing operation to stop."""
 
 
 class CrcKind(str, Enum):
@@ -132,7 +137,10 @@ def valid_crc(frame: bytes, config: FrameConfig) -> bool:
     return actual == expected
 
 
-def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
+def parse_chunks(
+    chunks: list[RxChunk], config: FrameConfig,
+    progress_callback: Callable[[int, int], bool] | None = None,
+) -> ParseResult:
     if config.protocol is FrameProtocol.CUSTOM and not config.header:
         raise ValueError("header must not be empty")
     result, buffer, pending_at = ParseResult(), bytearray(), None
@@ -215,7 +223,13 @@ def parse_chunks(chunks: list[RxChunk], config: FrameConfig) -> ParseResult:
                 result.events.append(ParseEvent("crc_error", expected, expected, "resynchronizing one byte"))
                 discard(1)
 
-    for chunk in chunks:
+    total_chunks = len(chunks)
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        # Refresh at a bounded cadence: enough for a responsive Cancel button,
+        # without making normal parsing pay a callback cost per serial record.
+        if progress_callback and (chunk_index == 1 or chunk_index == total_chunks or chunk_index % 100 == 0):
+            if not progress_callback(chunk_index, total_chunks):
+                raise OperationCancelled("parsing cancelled by user")
         if buffer and pending_at and chunk.timestamp and config.max_frame_gap_ms is not None:
             elapsed = (chunk.timestamp - pending_at).total_seconds() * 1000
             if elapsed > config.max_frame_gap_ms:

@@ -6,10 +6,10 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from frame_parser import FrameConfig, FrameEvidence, RxChunk
+from frame_parser import FrameConfig, FrameEvidence, OperationCancelled, RxChunk
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
-    analyze_log, match_transactions, read_directional_chunks,
+    analyze_log, detect_protocol, match_transactions, read_directional_chunks,
 )
 
 
@@ -111,6 +111,17 @@ class SerialLogTests(unittest.TestCase):
             result = analyze_log(path, FrameConfig(b"\xAA\x55", fixed_length=3), 2, 1, "little", 10)
         self.assertEqual(result.sequences, [1, 3])
         self.assertEqual((result.missing, result.loss_percent), (1, 100 / 3))
+
+    def test_log_read_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cancel.txt"
+            path.write_bytes(b"[12:00:00] RX AA 55 01\r\n")
+            with self.assertRaises(OperationCancelled):
+                read_directional_chunks(path, progress_callback=lambda _current, _total: False)
+
+    def test_protocol_detection_can_be_cancelled(self):
+        with self.assertRaises(OperationCancelled):
+            detect_protocol(b"\xAA\x55\x01" * 10, progress_callback=lambda _current, _total: False)
 
 
 if __name__ == "__main__":

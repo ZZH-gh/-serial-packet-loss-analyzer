@@ -15,6 +15,9 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
+
+from frame_parser import OperationCancelled
 
 
 HEX_BYTE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
@@ -300,7 +303,9 @@ def _payload_bytes(body: bytes) -> bytes:
     return bytes(int(token, 16) for token in HEX_BYTE_RAW.findall(body))
 
 
-def read_directional_chunks(path: Path) -> DirectionRead:
+def read_directional_chunks(
+    path: Path, progress_callback: Callable[[int, int], bool] | None = None,
+) -> DirectionRead:
     """Read SSCOM logs while preserving RX/TX evidence and timestamps.
 
     An unmarked continuation line inherits the immediately preceding direction.
@@ -308,32 +313,39 @@ def read_directional_chunks(path: Path) -> DirectionRead:
     ``unknown`` rather than silently calling it RX; the compatibility wrapper
     still returns those bytes for plain HEX logs.
     """
-    from frame_parser import RxChunk
+    from frame_parser import OperationCancelled, RxChunk
 
     result = DirectionRead()
     active_direction: str | None = None
-    for line_no, raw_line in enumerate(path.read_bytes().splitlines(), start=1):
-        timestamp, body = _timestamp_and_body(raw_line)
-        direction, payload_text, native = _direction_and_payload(body)
-        if direction:
-            result.direction_markers_found = True
-            active_direction = direction
-            if native:
-                result.native_sscom_markers += 1
-        elif active_direction:
-            direction = active_direction
-        payload = _payload_bytes(payload_text)
-        if not payload:
-            continue
-        chunk = RxChunk(payload, timestamp, line_no)
-        final_direction = direction or "unknown"
-        result.records.append(LoggedChunk(final_direction, chunk))
-        if final_direction == "rx":
-            result.rx_chunks.append(chunk)
-        elif final_direction == "tx":
-            result.tx_chunks.append(chunk)
-        else:
-            result.unknown_chunks.append(chunk)
+    total_bytes = path.stat().st_size
+    consumed = 0
+    with path.open("rb") as source:
+        for line_no, raw_line in enumerate(source, start=1):
+            consumed += len(raw_line)
+            if progress_callback and (line_no == 1 or line_no % 200 == 0 or consumed >= total_bytes):
+                if not progress_callback(consumed, total_bytes):
+                    raise OperationCancelled("log read cancelled by user")
+            timestamp, body = _timestamp_and_body(raw_line)
+            direction, payload_text, native = _direction_and_payload(body)
+            if direction:
+                result.direction_markers_found = True
+                active_direction = direction
+                if native:
+                    result.native_sscom_markers += 1
+            elif active_direction:
+                direction = active_direction
+            payload = _payload_bytes(payload_text)
+            if not payload:
+                continue
+            chunk = RxChunk(payload, timestamp, line_no)
+            final_direction = direction or "unknown"
+            result.records.append(LoggedChunk(final_direction, chunk))
+            if final_direction == "rx":
+                result.rx_chunks.append(chunk)
+            elif final_direction == "tx":
+                result.tx_chunks.append(chunk)
+            else:
+                result.unknown_chunks.append(chunk)
     return result
 
 
@@ -365,7 +377,9 @@ def frames(stream: bytes, header: bytes, frame_size: int):
         position = found + frame_size
 
 
-def detect_protocol(stream: bytes) -> Detection | None:
+def detect_protocol(
+    stream: bytes, progress_callback: Callable[[int, int], bool] | None = None,
+) -> Detection | None:
     """Suggest a two-byte header, fixed frame size, and sequence field.
 
     A candidate is useful only when it repeatedly occurs at the same spacing.
@@ -375,11 +389,19 @@ def detect_protocol(stream: bytes) -> Detection | None:
     if len(stream) < 24:
         return None
     positions: dict[bytes, list[int]] = {}
+    position_total = max(1, len(stream) - 1)
     for index in range(len(stream) - 1):
+        if progress_callback and (index == 0 or index % 4096 == 0 or index + 1 == position_total):
+            if not progress_callback(index + 1, position_total):
+                raise OperationCancelled("protocol detection cancelled by user")
         positions.setdefault(stream[index : index + 2], []).append(index)
 
     best: tuple[float, bytes, int] | None = None
-    for header, offsets in positions.items():
+    candidates = list(positions.items())
+    for candidate_index, (header, offsets) in enumerate(candidates, start=1):
+        if progress_callback and (candidate_index == 1 or candidate_index % 256 == 0 or candidate_index == len(candidates)):
+            if not progress_callback(candidate_index, len(candidates)):
+                raise OperationCancelled("protocol detection cancelled by user")
         if len(offsets) < 4:
             continue
         distances = [right - left for left, right in zip(offsets, offsets[1:])]
@@ -500,13 +522,17 @@ def analyze_cycles(
     return CycleModel(first, last, expected, evidence_cycles), results
 
 
-def detect_modbus_rtu(chunks: list) -> tuple[list[bytes], object] | None:
+def detect_modbus_rtu(
+    chunks: list, progress_callback: Callable[[int, int], bool] | None = None,
+) -> tuple[list[bytes], object] | None:
     """Return verified Modbus RTU frames when CRC establishes the profile."""
     from frame_parser import CrcKind, FrameConfig, FrameProtocol, parse_chunks
 
     if not chunks:
         return None
-    parsed = parse_chunks(chunks, FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS))
+    parsed = parse_chunks(
+        chunks, FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS), progress_callback,
+    )
     # Do not label random data as Modbus: at least three CRC-valid frames and
     # at least 80% of logged receive records must be explained.
     if len(parsed.frames) < 3 or len(parsed.frames) < len(chunks) * 0.8:
