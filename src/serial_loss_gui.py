@@ -311,19 +311,22 @@ class LossAnalyzerApp:
         ttk.Label(metric_copy, textvariable=self.primary_loss_detail, style="MetricContext.TLabel", wraplength=680, justify="left").pack(anchor="w", pady=(5, 0))
         self.primary_loss_value = ttk.Label(metric_panel, textvariable=self.primary_loss, style="MetricGood.TLabel", padding=(18, 18))
         self.primary_loss_value.pack(side=RIGHT)
-        self.result_label = ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel")
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill=BOTH, expand=True)
         table_frame = ttk.Frame(self.notebook)
+        detail_frame = ttk.Frame(self.notebook)
         preview_frame = ttk.Frame(self.notebook)
         evidence_frame = ttk.Frame(self.notebook)
         time_frame = ttk.Frame(self.notebook)
         comparison_frame = ttk.Frame(self.notebook)
         self.notebook.add(table_frame, text="统计明细")
+        self.notebook.add(detail_frame, text="分析说明")
         self.notebook.add(preview_frame, text="参数自检")
         self.notebook.add(evidence_frame, text="解析证据")
         self.notebook.add(time_frame, text="时间定位")
         self.notebook.add(comparison_frame, text="多文件对比")
+        self.result_label = ttk.Label(detail_frame, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel")
+        self.result_label.pack(fill=BOTH, expand=True, padx=2, pady=2)
         self.table = ttk.Treeview(
             table_frame,
             columns=("after", "first", "last", "count"),
@@ -392,7 +395,6 @@ class LossAnalyzerApp:
         self.comparison_table.configure(yscrollcommand=comparison_scroll.set)
         self.comparison_table.pack(side=LEFT, fill=BOTH, expand=True)
         comparison_scroll.pack(side=RIGHT, fill="y")
-        self.result_label.pack(fill="x", pady=(10, 0))
 
     def _watch_parameters(self) -> None:
         for variable in (
