@@ -2,4 +2,6 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+build_update/
+dist_update/
 *.spec
