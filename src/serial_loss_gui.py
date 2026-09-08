@@ -96,6 +96,9 @@ class LossAnalyzerApp:
         self.time_window_seconds = StringVar(value="60")
         self.crc = StringVar(value=CrcKind.NONE.value)
         self.result = StringVar(value="拖入 SSCOM 导出的 TXT/CSV/DAT 文件，或点击“选择日志文件”。")
+        self.primary_loss = StringVar(value="—")
+        self.primary_loss_label = StringVar(value="等待统计")
+        self.primary_loss_detail = StringVar(value="完成统计后显示当前日志的核心丢包率与统计口径。")
         self.parameter_source = StringVar(value="默认参数（尚未自检）")
         self.preview_note = StringVar(value="点击“参数自检”后，这里会显示当前参数切出的前 10 帧。")
         self.progress_message = StringVar(value="")
@@ -142,6 +145,13 @@ class LossAnalyzerApp:
         style.configure("Export.TButton", background="#FFF0D3", foreground="#8A5400", borderwidth=0, padding=(11, 8))
         style.map("Export.TButton", background=[("active", "#FFE0A8"), ("disabled", "#E7EDEF")])
         style.configure("Status.TLabel", background="#F9FCFD", foreground="#27485C", relief="solid", borderwidth=1, padding=10, font=("Microsoft YaHei UI", 9))
+        style.configure("Metric.TFrame", background="#102A43")
+        style.configure("MetricStripe.TFrame", background="#00A6A6")
+        style.configure("MetricEyebrow.TLabel", background="#102A43", foreground="#A9C3D7", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("MetricContext.TLabel", background="#102A43", foreground="#D6E4EC", font=("Microsoft YaHei UI", 9))
+        style.configure("MetricGood.TLabel", background="#102A43", foreground="#5EEAD4", font=("Consolas", 28, "bold"))
+        style.configure("MetricWatch.TLabel", background="#102A43", foreground="#FCD34D", font=("Consolas", 28, "bold"))
+        style.configure("MetricAlert.TLabel", background="#102A43", foreground="#FDA4AF", font=("Consolas", 28, "bold"))
         style.configure("Verify.TLabel", background="#E1F1EF", foreground="#075D67", relief="solid", borderwidth=1, padding=9, font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Progress.TLabel", background="#EAF1F5", foreground="#426176", font=("Microsoft YaHei UI", 8))
         style.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#18324A", rowheight=30, bordercolor="#C4D5DF", font=("Consolas", 9))
@@ -283,6 +293,16 @@ class LossAnalyzerApp:
         self.cancel_button.pack(side=RIGHT)
 
         ttk.Label(outer, text="03  分析结果", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        metric_panel = ttk.Frame(outer, style="Metric.TFrame")
+        metric_panel.pack(fill="x", pady=(0, 8))
+        ttk.Frame(metric_panel, style="MetricStripe.TFrame", width=7).pack(side=LEFT, fill="y")
+        metric_copy = ttk.Frame(metric_panel, style="Metric.TFrame", padding=(18, 12))
+        metric_copy.pack(side=LEFT, fill="both", expand=True)
+        ttk.Label(metric_copy, text="核心读数 · 丢包率", style="MetricEyebrow.TLabel").pack(anchor="w")
+        ttk.Label(metric_copy, textvariable=self.primary_loss_label, style="MetricContext.TLabel").pack(anchor="w", pady=(3, 0))
+        ttk.Label(metric_copy, textvariable=self.primary_loss_detail, style="MetricContext.TLabel", wraplength=680, justify="left").pack(anchor="w", pady=(5, 0))
+        self.primary_loss_value = ttk.Label(metric_panel, textvariable=self.primary_loss, style="MetricGood.TLabel", padding=(18, 18))
+        self.primary_loss_value.pack(side=RIGHT)
         ttk.Label(outer, textvariable=self.result, justify="left", wraplength=1000, style="Status.TLabel").pack(fill="x", pady=(0, 10))
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill=BOTH, expand=True)
@@ -419,6 +439,19 @@ class LossAnalyzerApp:
         self.auto_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
         self.preview_button.configure(state="normal")
+
+    def reset_primary_loss(self) -> None:
+        self.primary_loss.set("—")
+        self.primary_loss_label.set("等待统计")
+        self.primary_loss_detail.set("完成统计后显示当前日志的核心丢包率与统计口径。")
+        self.primary_loss_value.configure(style="MetricGood.TLabel")
+
+    def set_primary_loss(self, rate: float, label: str, detail: str) -> None:
+        self.primary_loss.set(f"{rate:.4f}%")
+        self.primary_loss_label.set(label)
+        self.primary_loss_detail.set(detail)
+        style = "MetricGood.TLabel" if rate == 0 else "MetricWatch.TLabel" if rate <= 0.1 else "MetricAlert.TLabel"
+        self.primary_loss_value.configure(style=style)
 
     def analysis_setup(self):
         path = Path(self.file_path.get())
@@ -764,6 +797,7 @@ class LossAnalyzerApp:
         self.time_table.delete(*self.time_table.get_children())
         self.comparison_table.delete(*self.comparison_table.get_children())
         self.invalidate_preview()
+        self.reset_primary_loss()
         self.evidence_rows = []
         self.comparison_rows = []
         self.last_report = None
@@ -899,6 +933,11 @@ class LossAnalyzerApp:
             raw_missing = sum(cycle.missing for cycle in self.cycle_results)
             raw_received = sum(cycle.received for cycle in self.cycle_results)
             raw_rate = 100 * raw_missing / (raw_received + raw_missing) if raw_received + raw_missing else 0.0
+            primary_label = "纳入循环的平均丢包率"
+            primary_detail = (
+                f"统计口径：仅纳入收到不少于 {coverage * 100:g}% 理论帧数的 {len(included)}/{len(self.cycle_results)} 轮；"
+                f"全部循环丢包率 {raw_rate:.4f}%。"
+            )
             analysis_stats = {
                 "mode": "cycle", "sequence_range": [model.first_sequence, model.last_sequence],
                 "expected_per_cycle": expected, "domain_evidence_cycles": model.evidence_cycles,
@@ -928,6 +967,8 @@ class LossAnalyzerApp:
                     resets += 1
             missing = sum(gap.count for gap in self.gaps)
             rate = 100 * missing / (len(sequences) + missing)
+            primary_label = "连续序号丢包率"
+            primary_detail = f"统计口径：有效完整帧 {len(sequences)}，缺失帧 {missing}；重复和异常跳变不计作丢包。"
             analysis_stats = {
                 "mode": "continuous", "received_frames": len(sequences), "missing_frames": missing,
                 "loss_percent": rate, "duplicates": duplicates, "restart_or_outlier": resets,
@@ -940,6 +981,7 @@ class LossAnalyzerApp:
                 f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n连续序号模式：接收帧数 {len(sequences)}，丢失帧数 {missing}，丢包率 {rate:.4f}%。\n"
                 f"重复序号：{duplicates}    疑似复位/异常跳变：{resets}    缺失区段：{len(self.gaps)}\n{self.transaction_note}"
             )
+        self.set_primary_loss(rate, primary_label, primary_detail)
         self.populate_evidence(parsed, sequences)
         interval_baseline, time_windows = self.populate_time_windows(parsed, sequences, seq_size, max_gap, time_window)
         self.populate_comparisons(config, seq_offset, seq_size, self.endian.get(), max_gap, coverage, manual_start, manual_count)
