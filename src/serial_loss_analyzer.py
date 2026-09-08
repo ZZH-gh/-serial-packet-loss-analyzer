@@ -26,6 +26,9 @@ RX_MARKER = re.compile(r"\b(?:rx|recv|receive|received)\b|接收|收到|<<|←",
 TX_MARKER = re.compile(r"\b(?:tx|send|sent)\b|发送|发出|>>|→", re.IGNORECASE)
 TIMESTAMP_PREFIX = re.compile(r"^\s*(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*")
 TIMESTAMP_PREFIX_RAW = re.compile(rb"^\s*(?:\[(?:(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+)?(\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\])?\s*")
+TABLE_TIMESTAMP_SUFFIX = re.compile(
+    r"(?P<date>\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(?P<time>\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*$"
+)
 
 # SSCOM 5.00a's traditional-Chinese direction glyphs are stored as these
 # byte sequences, which are not decodable by normal GBK tables.  Detecting
@@ -147,6 +150,206 @@ class LogAnalysis:
     @property
     def mode(self) -> str:
         return "cycle" if self.cycle_model else "continuous"
+
+
+@dataclass(frozen=True)
+class TimestampTableRow:
+    """One complete record in an already-decoded, timestamped table log."""
+
+    line_no: int
+    timestamp: datetime
+    field_count: int
+
+
+@dataclass(frozen=True)
+class TimestampTableLog:
+    """A table log detected without treating its numeric fields as HEX bytes."""
+
+    rows: tuple[TimestampTableRow, ...]
+    field_count: int
+    invalid_rows: int
+
+
+@dataclass(frozen=True)
+class TimestampGap:
+    start: TimestampTableRow
+    end: TimestampTableRow
+    interval_ms: float
+    estimated_missing: int
+
+
+@dataclass(frozen=True)
+class TimestampGapAnalysis:
+    """Best-effort timing continuity statistics, deliberately not frame loss."""
+
+    table: TimestampTableLog
+    baseline_interval_ms: float | None
+    normal_upper_interval_ms: float | None
+    threshold_ms: float | None
+    gaps: tuple[TimestampGap, ...]
+    time_reversals: int
+
+    @property
+    def received(self) -> int:
+        return len(self.table.rows)
+
+    @property
+    def suspected_missing(self) -> int:
+        return sum(gap.estimated_missing for gap in self.gaps)
+
+    @property
+    def gap_rate_percent(self) -> float:
+        total = self.received + self.suspected_missing
+        return 100 * self.suspected_missing / total if total else 0.0
+
+
+def _decode_table_text(raw: bytes) -> str | None:
+    """Decode human-readable exports while rejecting raw capture files early."""
+    if b"\0" in raw[:4096]:
+        return None
+    for encoding in ("utf-8-sig", "gb18030", "utf-16"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def detect_timestamp_table(
+    path: Path, progress_callback: Callable[[int, int], bool] | None = None,
+) -> TimestampTableLog | None:
+    """Detect fixed-column rows ending in a full date-and-time timestamp.
+
+    This intentionally requires a strong structural match.  A normal serial
+    export with a timestamp prefix or random numbers must remain in the frame
+    parser pipeline rather than being misclassified as a table log.
+    """
+    text = _decode_table_text(path.read_bytes())
+    if text is None:
+        return None
+    lines = text.splitlines()
+    rows: list[TimestampTableRow] = []
+    nonempty = invalid = 0
+    field_counts: dict[int, int] = {}
+    for line_no, line in enumerate(lines, start=1):
+        if progress_callback and line_no % 128 == 0 and not progress_callback(line_no, max(1, len(lines))):
+            raise OperationCancelled()
+        if not line.strip():
+            continue
+        nonempty += 1
+        match = TABLE_TIMESTAMP_SUFFIX.search(line)
+        if not match:
+            invalid += 1
+            continue
+        try:
+            timestamp = datetime.fromisoformat(
+                f"{match.group('date').replace('/', '-')} {match.group('time').replace(',', '.')}"
+            )
+        except ValueError:
+            invalid += 1
+            continue
+        values = line[:match.start()].strip(" \t,;")
+        field_count = len([value for value in re.split(r"[\s,;]+", values) if value])
+        if field_count < 3:
+            invalid += 1
+            continue
+        rows.append(TimestampTableRow(line_no, timestamp, field_count))
+        field_counts[field_count] = field_counts.get(field_count, 0) + 1
+
+    if progress_callback and not progress_callback(len(lines), max(1, len(lines))):
+        raise OperationCancelled()
+    if len(rows) < 3 or nonempty == 0:
+        return None
+    field_count, matching_fields = max(field_counts.items(), key=lambda item: item[1])
+    # At least 90% of nonblank records must parse and share the same table
+    # width.  This leaves a small allowance for headers or damaged lines.
+    if len(rows) / nonempty < 0.9 or matching_fields / len(rows) < 0.9:
+        return None
+    invalid += len(rows) - matching_fields
+    stable_rows = tuple(row for row in rows if row.field_count == field_count)
+    return TimestampTableLog(stable_rows, field_count, invalid)
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * percentile)]
+
+
+def analyze_timestamp_gaps(table: TimestampTableLog) -> TimestampGapAnalysis:
+    """Estimate time discontinuities without claiming exact protocol loss.
+
+    A robust median is used only as a scale.  The 95th-percentile normal
+    interval also contributes to the threshold, which prevents a legitimate
+    two-cadence logger from counting its slower cadence as a missing record.
+    """
+    positive = [
+        (right.timestamp - left.timestamp).total_seconds() * 1000
+        for left, right in zip(table.rows, table.rows[1:])
+        if right.timestamp >= left.timestamp
+    ]
+    baseline = statistics.median(positive) if positive else None
+    # Derive the "normal" upper bound from the central cadence cluster, not
+    # from every interval.  Otherwise one genuine long pause in a short file
+    # would inflate the 95th percentile enough to hide itself.
+    normal_intervals = (
+        [interval for interval in positive if baseline * 0.65 <= interval <= baseline * 1.35]
+        if baseline and baseline > 0 else []
+    )
+    normal_upper = _percentile(normal_intervals, 0.95) if normal_intervals else None
+    threshold = (
+        max(baseline * 1.6, normal_upper * 1.25)
+        if baseline and normal_upper and baseline > 0
+        else None
+    )
+    gaps: list[TimestampGap] = []
+    reversals = 0
+    for left, right in zip(table.rows, table.rows[1:]):
+        interval_ms = (right.timestamp - left.timestamp).total_seconds() * 1000
+        if interval_ms < 0:
+            reversals += 1
+            continue
+        if threshold is not None and interval_ms > threshold:
+            estimated = max(1, int(interval_ms / baseline + 0.5) - 1)
+            gaps.append(TimestampGap(left, right, interval_ms, estimated))
+    return TimestampGapAnalysis(table, baseline, normal_upper, threshold, tuple(gaps), reversals)
+
+
+def analyze_timestamp_windows(
+    table: TimestampTableLog, analysis: TimestampGapAnalysis, window_seconds: int,
+) -> list[TimeWindowResult]:
+    """Put rows and timing gaps into the same user-selected time buckets."""
+    buckets: dict[datetime, dict] = {}
+
+    def bucket_at(timestamp: datetime) -> dict:
+        seconds = timestamp.hour * 3600 + timestamp.minute * 60 + timestamp.second
+        bucket_seconds = (seconds // window_seconds) * window_seconds
+        start = timestamp.replace(
+            hour=bucket_seconds // 3600,
+            minute=(bucket_seconds % 3600) // 60,
+            second=bucket_seconds % 60,
+            microsecond=0,
+        )
+        return buckets.setdefault(start, {"received": 0, "missing": 0, "intervals": [], "long": 0})
+
+    for row in table.rows:
+        bucket_at(row.timestamp)["received"] += 1
+    for left, right in zip(table.rows, table.rows[1:]):
+        interval_ms = (right.timestamp - left.timestamp).total_seconds() * 1000
+        if interval_ms >= 0:
+            bucket_at(right.timestamp)["intervals"].append(interval_ms)
+    for gap in analysis.gaps:
+        bucket = bucket_at(gap.end.timestamp)
+        bucket["missing"] += gap.estimated_missing
+        bucket["long"] += 1
+    return [
+        TimeWindowResult(
+            start, data["received"], data["missing"],
+            statistics.mean(data["intervals"]) if data["intervals"] else None,
+            max(data["intervals"]) if data["intervals"] else None,
+            data["long"],
+        )
+        for start, data in sorted(buckets.items())
+    ]
 
 
 def analyze_time_windows(

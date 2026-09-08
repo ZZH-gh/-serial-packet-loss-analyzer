@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from frame_parser import CrcKind, FrameConfig, FrameEvidence, FrameProtocol, OperationCancelled, RxChunk, crc16_modbus, parse_chunks
 from serial_loss_analyzer import (
     DirectionRead, LoggedChunk, SSCOM_RX_LABEL, SSCOM_TX_LABEL, analyze_cycles, analyze_time_windows,
-    analyze_log, detect_protocol, match_transactions, read_directional_chunks,
+    analyze_log, analyze_timestamp_gaps, analyze_timestamp_windows, detect_protocol,
+    detect_timestamp_table, match_transactions, read_directional_chunks,
 )
 
 
@@ -135,6 +136,47 @@ class SerialLogTests(unittest.TestCase):
         self.assertEqual([chunk.data for chunk in result.rx_chunks], [frame * 3])
         parsed = parse_chunks(result.rx_chunks, FrameConfig(protocol=FrameProtocol.MODBUS_RTU, crc=CrcKind.MODBUS))
         self.assertEqual(parsed.frames, [frame, frame, frame])
+
+    def test_timestamp_table_detects_fixed_columns_and_ignores_two_normal_cadences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "decoded.txt"
+            path.write_text(
+                "1 2 3 2026-09-07 16:00:00.000\n"
+                "4 5 6 2026-09-07 16:00:00.208\n"
+                "7 8 9 2026-09-07 16:00:00.437\n"
+                "10 11 12 2026-09-07 16:00:00.646\n",
+                encoding="utf-8",
+            )
+            table = detect_timestamp_table(path)
+        self.assertIsNotNone(table)
+        self.assertEqual((len(table.rows), table.field_count, table.invalid_rows), (4, 3, 0))
+        analysis = analyze_timestamp_gaps(table)
+        self.assertEqual((analysis.suspected_missing, len(analysis.gaps)), (0, 0))
+
+    def test_timestamp_table_estimates_only_clear_time_discontinuities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "decoded.csv"
+            path.write_text(
+                "1,2,3,2026-09-07 16:00:00.000\n"
+                "4,5,6,2026-09-07 16:00:00.210\n"
+                "7,8,9,2026-09-07 16:00:00.420\n"
+                "10,11,12,2026-09-07 16:00:01.260\n"
+                "13,14,15,2026-09-07 16:00:01.470\n",
+                encoding="utf-8",
+            )
+            table = detect_timestamp_table(path)
+        analysis = analyze_timestamp_gaps(table)
+        self.assertEqual(analysis.suspected_missing, 3)
+        self.assertEqual(len(analysis.gaps), 1)
+        self.assertAlmostEqual(analysis.gap_rate_percent, 37.5)
+        windows = analyze_timestamp_windows(table, analysis, 60)
+        self.assertEqual((windows[0].received, windows[0].missing, windows[0].long_intervals), (5, 3, 1))
+
+    def test_timestamp_table_does_not_misclassify_serial_timestamp_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.txt"
+            path.write_text("[16:00:00.000] RX AA 55 01\n[16:00:00.100] RX AA 55 02\n", encoding="utf-8")
+            self.assertIsNone(detect_timestamp_table(path))
 
 
 if __name__ == "__main__":

@@ -18,8 +18,9 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from frame_parser import CrcKind, FrameConfig, FrameProtocol, OperationCancelled, parse_chunks
 from serial_loss_analyzer import (
-    CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, detect_modbus_rtu,
-    detect_protocol, detect_sequence_field, match_transactions, parse_hex, read_directional_chunks,
+    CycleResult, Gap, analyze_cycles, analyze_log, analyze_time_windows, analyze_timestamp_gaps,
+    analyze_timestamp_windows, detect_modbus_rtu, detect_protocol, detect_sequence_field,
+    detect_timestamp_table, match_transactions, parse_hex, read_directional_chunks,
 )
 
 
@@ -110,6 +111,8 @@ class LossAnalyzerApp:
         self.direction_note = ""
         self.direction_read = None
         self.transaction_note = ""
+        self.timestamp_table = None
+        self.timestamp_gap_analysis = None
         self.evidence_rows: list[dict[str, str]] = []
         self.last_report: dict | None = None
         self.compare_paths: list[Path] = []
@@ -362,8 +365,8 @@ class LossAnalyzerApp:
 
         self.time_table = ttk.Treeview(time_frame, columns=("time", "frames", "missing", "loss", "avg", "max", "long"), show="headings", height=10)
         for key, text, width in (
-            ("time", "时间段", 150), ("frames", "有效帧", 95), ("missing", "缺失帧", 95),
-            ("loss", "丢包率", 95), ("avg", "平均间隔", 110), ("max", "最大间隔", 110), ("long", "异常长间隔", 110),
+            ("time", "时间段", 150), ("frames", "有效记录", 95), ("missing", "缺失/漏采", 95),
+            ("loss", "丢包/断档率", 105), ("avg", "平均间隔", 110), ("max", "最大间隔", 110), ("long", "异常长间隔", 110),
         ):
             self.time_table.heading(key, text=text)
             self.time_table.column(key, width=width, anchor="center", stretch=True)
@@ -375,7 +378,7 @@ class LossAnalyzerApp:
         self.comparison_table = ttk.Treeview(comparison_frame, columns=("file", "mode", "frames", "loss", "missing", "worst", "crc", "truncated", "direction", "result"), show="headings", height=10)
         for key, text, width in (
             ("file", "日志文件", 240), ("mode", "统计模式", 90), ("frames", "完整帧", 80),
-            ("loss", "丢包率", 85), ("missing", "缺失帧", 85), ("worst", "最差循环", 105), ("crc", "CRC错误", 85),
+            ("loss", "丢包/断档率", 105), ("missing", "缺失/漏采", 85), ("worst", "最差循环/阈值", 115), ("crc", "CRC错误", 85),
             ("truncated", "截断", 70), ("direction", "RX/TX", 100), ("result", "结果", 190),
         ):
             self.comparison_table.heading(key, text=text)
@@ -396,6 +399,10 @@ class LossAnalyzerApp:
 
     def _on_parameter_change(self, *_args) -> None:
         if self._setting_parameters:
+            return
+        if self.timestamp_table is not None:
+            self.parameter_source.set("自动识别：时间戳表格日志（无需帧参数）")
+            self.preview_note.set("此类日志按“每行一条记录 + 末尾时间戳”统计；修改时间窗口后重新点击“开始统计”即可。")
             return
         self.parameter_source.set("人工调整（请重新自检）")
         self.invalidate_preview()
@@ -438,7 +445,7 @@ class LossAnalyzerApp:
         self.cancel_button.configure(state="disabled")
         self.auto_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
-        self.preview_button.configure(state="normal")
+        self.preview_button.configure(state="disabled" if self.timestamp_table is not None else "normal")
 
     def reset_primary_loss(self) -> None:
         self.primary_loss.set("—")
@@ -795,6 +802,8 @@ class LossAnalyzerApp:
         self.input_stream = b""
         self.input_chunks = []
         self.direction_read = None
+        self.timestamp_table = None
+        self.timestamp_gap_analysis = None
         self.table.delete(*self.table.get_children())
         self.evidence.delete(*self.evidence.get_children())
         self.time_table.delete(*self.time_table.get_children())
@@ -816,6 +825,16 @@ class LossAnalyzerApp:
             path = Path(self.file_path.get())
             if not path.is_file():
                 raise ValueError("请先拖入或选择日志文件。")
+            self.timestamp_table = detect_timestamp_table(path, self.progress_callback("正在识别时间戳表格"))
+            if self.timestamp_table is not None:
+                self.parameter_source.set("自动识别：时间戳表格日志（无需帧参数）")
+                self.preview_note.set("此类日志按“每行一条记录 + 末尾时间戳”统计，不进行帧参数自检。")
+                self.direction_note = (
+                    f"已识别为时间戳表格日志：每条记录 {self.timestamp_table.field_count} 个数据字段，"
+                    f"共 {len(self.timestamp_table.rows)} 条有效记录。"
+                )
+                self.analyze_timestamp_table()
+                return
             self.direction_read = read_directional_chunks(path, self.progress_callback("正在读取日志"))
             has_markers = self.direction_read.direction_markers_found
             is_raw_receive = self.direction_read.raw_binary_receive
@@ -898,7 +917,146 @@ class LossAnalyzerApp:
         finally:
             self.finish_operation()
 
+    def populate_timestamp_evidence(self) -> None:
+        """Show only discontinuity evidence; this format has no protocol frames."""
+        self.evidence.delete(*self.evidence.get_children())
+        self.evidence_rows = []
+        analysis = self.timestamp_gap_analysis
+        if analysis is None:
+            return
+        for index, gap in enumerate(analysis.gaps, start=1):
+            row = {
+                "frame": f"断档 {index}",
+                "lines": f"{gap.start.line_no}→{gap.end.line_no}",
+                "time": gap.end.timestamp.strftime("%H:%M:%S.%f")[:-3],
+                "bytes": f"{gap.start.timestamp.strftime('%H:%M:%S.%f')[:-3]} → {gap.end.timestamp.strftime('%H:%M:%S.%f')[:-3]}（{gap.interval_ms:.1f} ms）",
+                "sequence": str(gap.estimated_missing),
+                "status": "疑似漏采；仅由时间断档推测，非序号确证",
+            }
+            self.evidence_rows.append(row)
+            self.evidence.insert("", END, values=(row["frame"], row["lines"], row["time"], row["bytes"], row["sequence"], row["status"]))
+
+    def populate_timestamp_windows(self, windows: list) -> None:
+        self.time_table.delete(*self.time_table.get_children())
+        for window in windows:
+            average = f"{window.average_interval_ms:.1f} ms" if window.average_interval_ms is not None else "—"
+            maximum = f"{window.max_interval_ms:.1f} ms" if window.max_interval_ms is not None else "—"
+            self.time_table.insert(
+                "", END,
+                values=(window.start.strftime("%H:%M:%S"), window.received, window.missing, f"{window.loss_percent:.2f}%", average, maximum, window.long_intervals),
+            )
+
+    def populate_timestamp_comparisons(self) -> None:
+        self.comparison_table.delete(*self.comparison_table.get_children())
+        self.comparison_rows = []
+        for path in self.compare_paths:
+            try:
+                table = detect_timestamp_table(path)
+                if table is None:
+                    raise ValueError("不是同类的时间戳表格日志")
+                analysis = analyze_timestamp_gaps(table)
+                baseline = f"{analysis.baseline_interval_ms:.1f} ms" if analysis.baseline_interval_ms else "—"
+                threshold = f"{analysis.threshold_ms:.1f} ms" if analysis.threshold_ms else "—"
+                row = {
+                    "file": path.name, "mode": "时间断档", "frames": str(analysis.received),
+                    "loss": f"{analysis.gap_rate_percent:.4f}%", "missing": str(analysis.suspected_missing),
+                    "worst": f"阈值 {threshold}", "crc": "—", "truncated": str(table.invalid_rows),
+                    "direction": "表格时间戳", "result": f"基准 {baseline}；断档 {len(analysis.gaps)} 次",
+                }
+            except (OSError, ValueError) as error:
+                row = {"file": path.name, "mode": "—", "frames": "—", "loss": "—", "missing": "—", "worst": "—", "crc": "—", "truncated": "—", "direction": "—", "result": f"无法分析：{error}"}
+            self.comparison_rows.append(row)
+            self.comparison_table.insert("", END, values=tuple(row[key] for key in ("file", "mode", "frames", "loss", "missing", "worst", "crc", "truncated", "direction", "result")))
+        self.comparison_export_button.configure(state="normal" if self.comparison_rows else "disabled")
+
+    def analyze_timestamp_table(self) -> None:
+        """Analyze an already-decoded table log without pretending it is UART HEX."""
+        if self.timestamp_table is None:
+            raise ValueError("尚未识别到时间戳表格日志。")
+        try:
+            time_window = int(self.time_window_seconds.get())
+            if not 1 <= time_window <= 3600:
+                raise ValueError("时间统计窗口必须在 1 到 3600 秒之间。")
+        except ValueError as error:
+            messagebox.showerror("无法统计", str(error))
+            return
+        path = Path(self.file_path.get())
+        analysis = analyze_timestamp_gaps(self.timestamp_table)
+        windows = analyze_timestamp_windows(self.timestamp_table, analysis, time_window)
+        self.timestamp_gap_analysis = analysis
+        self.table.delete(*self.table.get_children())
+        self.gaps = []
+        self.cycle_results = []
+        self.cyclic_mode = False
+        self.set_table_headings((("after", "断档起点"), ("first", "断档终点"), ("last", "实际 / 基准间隔"), ("count", "疑似漏采")))
+        for gap in analysis.gaps:
+            self.table.insert(
+                "", END,
+                values=(
+                    gap.start.timestamp.strftime("%H:%M:%S.%f")[:-3],
+                    gap.end.timestamp.strftime("%H:%M:%S.%f")[:-3],
+                    f"{gap.interval_ms:.1f} / {analysis.baseline_interval_ms:.1f} ms",
+                    gap.estimated_missing,
+                ),
+            )
+        primary_label = "时间断档率（疑似漏采）"
+        primary_detail = (
+            f"统计口径：有效记录 {analysis.received}，以自动学习的时间节拍识别 {len(analysis.gaps)} 处断档，"
+            f"估计漏采 {analysis.suspected_missing} 条；无递增序号，不能称为精确丢包率。"
+        )
+        self.set_primary_loss(analysis.gap_rate_percent, primary_label, primary_detail)
+        self.populate_timestamp_evidence()
+        self.populate_timestamp_windows(windows)
+        self.populate_timestamp_comparisons()
+        baseline = f"{analysis.baseline_interval_ms:.1f} ms" if analysis.baseline_interval_ms is not None else "不足"
+        upper = f"{analysis.normal_upper_interval_ms:.1f} ms" if analysis.normal_upper_interval_ms is not None else "—"
+        threshold = f"{analysis.threshold_ms:.1f} ms" if analysis.threshold_ms is not None else "—"
+        self.result.set(
+            f"{self.direction_note}\n"
+            f"时间断档模式：有效记录 {analysis.received}，字段数 {self.timestamp_table.field_count}，格式异常行 {self.timestamp_table.invalid_rows}，时间倒退 {analysis.time_reversals} 次。\n"
+            f"自动节拍：中位间隔 {baseline}，正常上沿 {upper}，断档阈值 {threshold}（取中位间隔 × 1.6 与正常上沿 × 1.25 的较大值）。\n"
+            f"发现 {len(analysis.gaps)} 处时间断档，疑似漏采 {analysis.suspected_missing} 条，时间断档率 {analysis.gap_rate_percent:.4f}%。\n"
+            "说明：该结论只反映日志记录时间的不连续；未携带递增序号时，不能区分设备未发送、链路漏收或日志程序未写入。"
+        )
+        credibility = {
+            "level": "较高" if not self.timestamp_table.invalid_rows and not analysis.time_reversals else "中等",
+            "checks": {
+                "mode": "固定列数 + 行尾完整时间戳自动识别",
+                "valid_records": analysis.received,
+                "field_count": self.timestamp_table.field_count,
+                "invalid_rows": self.timestamp_table.invalid_rows,
+                "time_reversals": analysis.time_reversals,
+            },
+            "warnings": (["此格式没有递增序号，时间断档率不是精确丢包率"] +
+                         ([f"发现 {self.timestamp_table.invalid_rows} 行格式异常"] if self.timestamp_table.invalid_rows else []) +
+                         ([f"发现 {analysis.time_reversals} 次时间倒退"] if analysis.time_reversals else [])),
+        }
+        file_bytes = path.read_bytes()
+        self.last_report = {
+            "format": "serial-loss-analysis-report", "version": 2,
+            "input": {"file_name": path.name, "bytes": len(file_bytes), "sha256": hashlib.sha256(file_bytes).hexdigest()},
+            "parameters": {"mode": "timestamp_table", "time_window_seconds": time_window, "gap_rule": "max(median*1.6, p95*1.25)"},
+            "statistics": {
+                "mode": "timestamp_table", "valid_records": analysis.received,
+                "field_count": self.timestamp_table.field_count, "invalid_rows": self.timestamp_table.invalid_rows,
+                "baseline_interval_ms": analysis.baseline_interval_ms, "normal_upper_interval_ms": analysis.normal_upper_interval_ms,
+                "gap_threshold_ms": analysis.threshold_ms, "time_reversals": analysis.time_reversals,
+                "suspected_missing_records": analysis.suspected_missing, "time_gap_rate_percent": analysis.gap_rate_percent,
+                "gaps": [{"start_line": gap.start.line_no, "end_line": gap.end.line_no, "start": gap.start.timestamp.isoformat(), "end": gap.end.timestamp.isoformat(), "interval_ms": gap.interval_ms, "estimated_missing": gap.estimated_missing} for gap in analysis.gaps],
+            },
+            "time_statistics": {"window_seconds": time_window, "windows": [{"start": item.start.isoformat(), "received": item.received, "suspected_missing": item.missing, "time_gap_rate_percent": item.loss_percent, "average_interval_ms": item.average_interval_ms, "max_interval_ms": item.max_interval_ms, "time_gaps": item.long_intervals} for item in windows]},
+            "credibility": credibility,
+            "evidence_csv_columns": ["frame", "lines", "time", "bytes", "sequence", "status"],
+            "comparisons": self.comparison_rows,
+        }
+        self.export_button.configure(state="normal")
+        self.evidence_export_button.configure(state="normal")
+        self.report_export_button.configure(state="normal")
+
     def analyze(self) -> None:
+        if self.timestamp_table is not None:
+            self.analyze_timestamp_table()
+            return
         try:
             path, config, seq_offset, seq_size, max_gap, time_window, coverage, manual_start, manual_count = self.analysis_setup()
             self.ensure_input_chunks(path)
@@ -1059,7 +1217,15 @@ class LossAnalyzerApp:
             return
         with Path(filename).open("w", newline="", encoding="utf-8-sig") as output:
             writer = csv.writer(output)
-            if self.cyclic_mode:
+            if self.timestamp_gap_analysis is not None:
+                writer.writerow(("start_line", "end_line", "start_time", "end_time", "interval_ms", "baseline_interval_ms", "estimated_missing", "note"))
+                for gap in self.timestamp_gap_analysis.gaps:
+                    writer.writerow((
+                        gap.start.line_no, gap.end.line_no, gap.start.timestamp.isoformat(), gap.end.timestamp.isoformat(),
+                        f"{gap.interval_ms:.3f}", f"{self.timestamp_gap_analysis.baseline_interval_ms:.3f}",
+                        gap.estimated_missing, "suspected_missing_from_time_gap_not_sequence_confirmed",
+                    ))
+            elif self.cyclic_mode:
                 writer.writerow(("cycle", "observed_first", "observed_last", "received_frames", "expected_frames", "missing_frames", "duplicate_frames", "included", "missing_sequence_ids"))
                 for cycle in self.cycle_results:
                     writer.writerow((
