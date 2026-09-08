@@ -138,7 +138,6 @@ class LossAnalyzerApp:
         style.configure("Hint.TLabel", background="#EAF1F5", foreground="#62778A", font=("Microsoft YaHei UI", 8))
         style.configure("Help.TLabel", background="#EAF1F5", foreground="#007C91", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Tooltip.TLabel", background="#102A43", foreground="#FFFFFF", relief="solid", borderwidth=1, font=("Microsoft YaHei UI", 9))
-        style.configure("Drop.TLabel", background="#F9FCFD", foreground="#26526B", font=("Microsoft YaHei UI", 11, "bold"), relief="solid", borderwidth=1)
         style.configure("TLabelframe", background="#EAF1F5", bordercolor="#C4D5DF", relief="solid")
         style.configure("TLabelframe.Label", background="#EAF1F5", foreground="#1D536C", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("TEntry", fieldbackground="#FFFFFF", bordercolor="#B9CEDA", padding=6)
@@ -203,19 +202,8 @@ class LossAnalyzerApp:
 
         ttk.Label(outer, text="01  导入日志", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
-        drop = ttk.Label(
-            outer,
-            text="拖入 SSCOM 导出的日志文件\nTXT / CSV / DAT  ·  可连续拖入新文件，无需重启",
-            anchor="center",
-            style="Drop.TLabel",
-            padding=16,
-        )
-        drop.pack(fill="x")
-        drop.drop_target_register(DND_FILES)
-        drop.dnd_bind("<<Drop>>", self.on_drop)
-
         file_row = ttk.Frame(outer, style="App.TFrame")
-        file_row.pack(fill="x", pady=(10, 16))
+        file_row.pack(fill="x", pady=(0, 16))
         ttk.Entry(file_row, textvariable=self.file_path, state="readonly").pack(side=LEFT, fill="x", expand=True)
         ttk.Button(file_row, text="选择多份对比", command=self.choose_compare_files, style="Secondary.TButton").pack(side=RIGHT, padx=(6, 0))
         ttk.Button(file_row, text="选择日志文件", command=self.choose_file, style="Secondary.TButton").pack(side=RIGHT, padx=(10, 0))
