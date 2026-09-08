@@ -107,6 +107,7 @@ class LossAnalyzerApp:
         self.progress_message = StringVar(value="")
         self.gaps: list[Gap] = []
         self.cycle_results: list[CycleResult] = []
+        self.manually_ignored_cycles: set[int] = set()
         self.cyclic_mode = False
         self.input_stream = b""
         self.input_chunks = []
@@ -276,6 +277,10 @@ class LossAnalyzerApp:
         self.preview_button.pack(side=LEFT, padx=(8, 0))
         self.analyze_button = ttk.Button(buttons, text="开始统计", command=self.analyze, style="Primary.TButton")
         self.analyze_button.pack(side=LEFT, padx=(8, 18))
+        self.ignore_cycles_button = ttk.Button(buttons, text="忽略选中轮次", command=self.ignore_selected_cycles, state="disabled", style="Secondary.TButton")
+        self.ignore_cycles_button.pack(side=LEFT)
+        self.restore_cycles_button = ttk.Button(buttons, text="恢复选中轮次", command=self.restore_selected_cycles, state="disabled", style="Secondary.TButton")
+        self.restore_cycles_button.pack(side=LEFT, padx=(4, 14))
         ttk.Button(buttons, text="保存方案", command=self.save_profile, style="Secondary.TButton").pack(side=LEFT)
         ttk.Button(buttons, text="加载方案", command=self.load_profile, style="Secondary.TButton").pack(side=LEFT, padx=(4, 14))
         self.export_button = ttk.Button(buttons, text="导出缺失 CSV", command=self.export, state="disabled", style="Export.TButton")
@@ -470,6 +475,10 @@ class LossAnalyzerApp:
     def _on_parameter_change(self, *_args) -> None:
         if self._setting_parameters:
             return
+        # An exclusion is meaningful only for the exact set of rules that
+        # produced the current cycles. Do not silently carry it into a new
+        # frame or sequence configuration.
+        self.manually_ignored_cycles.clear()
         if self._auto_display_mode == "modbus" and not self.profile.get().startswith("Modbus"):
             self.restore_protocol_parameter_inputs()
         elif self._auto_display_mode == "timestamp_table" and self.profile.get() != "时间戳表格（自动）":
@@ -544,6 +553,30 @@ class LossAnalyzerApp:
         self.primary_loss_label.set("未发现可信序号")
         self.primary_loss_detail.set(detail)
         self.primary_loss_value.configure(style="MetricWatch.TLabel")
+
+    def selected_cycle_indexes(self) -> set[int]:
+        """Return Ctrl-selected cycle rows, ignoring non-cycle result rows."""
+        indexes: set[int] = set()
+        for item in self.table.selection():
+            if item.startswith("cycle-"):
+                indexes.add(int(item.removeprefix("cycle-")))
+        return indexes
+
+    def ignore_selected_cycles(self) -> None:
+        indexes = self.selected_cycle_indexes()
+        if not indexes:
+            messagebox.showinfo("未选择循环", "请在“统计明细”中单击或按住 Ctrl 选择一个或多个循环后再忽略。")
+            return
+        self.manually_ignored_cycles.update(indexes)
+        self.analyze()
+
+    def restore_selected_cycles(self) -> None:
+        indexes = self.selected_cycle_indexes()
+        if not indexes:
+            messagebox.showinfo("未选择循环", "请在“统计明细”中选择要恢复纳入的循环。")
+            return
+        self.manually_ignored_cycles.difference_update(indexes)
+        self.analyze()
 
     def analysis_setup(self):
         path = Path(self.file_path.get())
@@ -761,7 +794,10 @@ class LossAnalyzerApp:
                     status += "；序号回绕/新循环"
             if self.cyclic_mode and cycle_index <= len(self.cycle_results):
                 cycle = self.cycle_results[cycle_index - 1]
-                status += f"；循环 {cycle_index} {'纳入' if cycle.included else '采集冗余'}"
+                if cycle.index in self.manually_ignored_cycles:
+                    status += f"；循环 {cycle_index} 手动忽略"
+                else:
+                    status += f"；循环 {cycle_index} {'纳入' if cycle.included else '采集冗余'}"
             line_text = str(evidence.first_line_no)
             if evidence.last_line_no != evidence.first_line_no:
                 line_text += f"→{evidence.last_line_no}"
@@ -940,7 +976,10 @@ class LossAnalyzerApp:
         self.compare_paths = comparison_paths or [path]
         self.gaps = []
         self.cycle_results = []
+        self.manually_ignored_cycles.clear()
         self.cyclic_mode = False
+        self.ignore_cycles_button.configure(state="disabled")
+        self.restore_cycles_button.configure(state="disabled")
         self.input_stream = b""
         self.input_chunks = []
         self.direction_read = None
@@ -1263,41 +1302,54 @@ class LossAnalyzerApp:
         if cyclic is not None:
             model, self.cycle_results = cyclic
             expected = model.expected
-            included = [cycle for cycle in self.cycle_results if cycle.included]
+            included = [
+                cycle for cycle in self.cycle_results
+                if cycle.included and cycle.index not in self.manually_ignored_cycles
+            ]
             missing = sum(cycle.missing for cycle in included)
             received = sum(cycle.received for cycle in included)
             rate = 100 * missing / (received + missing) if received + missing else 0.0
+            self.ignore_cycles_button.configure(state="normal")
+            self.restore_cycles_button.configure(state="normal")
             self.set_table_headings((("after", "循环 / 范围"), ("first", "接收帧数"), ("last", "理论帧数"), ("count", "结果 / 丢包率")))
             for cycle in self.cycle_results:
-                if cycle.included:
+                if cycle.index in self.manually_ignored_cycles:
+                    result = "手动忽略"
+                elif cycle.included:
                     result = f"纳入  {cycle.missing / cycle.expected * 100:.2f}%（缺 {cycle.missing}）"
                 else:
                     result = f"忽略（少于 {coverage * 100:g}%）"
-                self.table.insert("", END, values=(f"{cycle.index} ({cycle.first}..{cycle.last})", cycle.received, cycle.expected, result))
+                self.table.insert("", END, iid=f"cycle-{cycle.index}", values=(f"{cycle.index} ({cycle.first}..{cycle.last})", cycle.received, cycle.expected, result))
             ignored = len(self.cycle_results) - len(included)
+            manually_ignored = [cycle for cycle in self.cycle_results if cycle.index in self.manually_ignored_cycles]
             raw_missing = sum(cycle.missing for cycle in self.cycle_results)
             raw_received = sum(cycle.received for cycle in self.cycle_results)
             raw_rate = 100 * raw_missing / (raw_received + raw_missing) if raw_received + raw_missing else 0.0
             primary_label = "纳入循环的平均丢包率"
             primary_detail = (
                 f"统计口径：仅纳入收到不少于 {coverage * 100:g}% 理论帧数的 {len(included)}/{len(self.cycle_results)} 轮；"
-                f"全部循环丢包率 {raw_rate:.4f}%。"
+                f"手动排除 {len(manually_ignored)} 轮；全部循环丢包率 {raw_rate:.4f}%。"
             )
             analysis_stats = {
                 "mode": "cycle", "sequence_range": [model.first_sequence, model.last_sequence],
                 "expected_per_cycle": expected, "domain_evidence_cycles": model.evidence_cycles,
                 "coverage_threshold_percent": coverage * 100, "all_cycles_loss_percent": raw_rate,
                 "included_cycles_loss_percent": rate,
-                "cycles": [{"index": cycle.index, "received": cycle.received, "missing": cycle.missing, "included": cycle.included, "missing_sequence_ids": list(cycle.missing_values)} for cycle in self.cycle_results],
+                "cycles": [{"index": cycle.index, "received": cycle.received, "missing": cycle.missing,
+                            "included": cycle.included and cycle.index not in self.manually_ignored_cycles,
+                            "manual_ignored": cycle.index in self.manually_ignored_cycles,
+                            "missing_sequence_ids": list(cycle.missing_values)} for cycle in self.cycle_results],
             }
             self.result.set(
                 f"{self.direction_note} 完整帧 {len(captured)}，截断 {parsed.truncations}，CRC错误 {parsed.crc_errors}，噪声 {parsed.noise_bytes} 字节。\n循环模式：自动识别每轮理论帧数为 {expected}。共 {len(self.cycle_results)} 轮，纳入 {len(included)} 轮，忽略 {ignored} 轮。\n"
                 f"理论序号范围：{model.first_sequence}..{model.last_sequence}，"
                 f"{'由使用者手动设定' if model.evidence_cycles == 0 else f'由 {model.evidence_cycles} 个完整范围循环共同证实'}。\n"
-                f"全部循环丢包率：{raw_rate:.4f}%；纳入循环的平均丢包率：{rate:.4f}%（少于 {expected * coverage:g} 帧，即 {coverage * 100:g}% 的循环未计入）。\n"
+                f"全部循环丢包率：{raw_rate:.4f}%；纳入循环的平均丢包率：{rate:.4f}%（少于 {expected * coverage:g} 帧，即 {coverage * 100:g}% 的循环未计入；手动忽略 {len(manually_ignored)} 轮）。\n"
                 f"每轮的确切缺失序号可通过“导出缺失明细 CSV”复核。\n{self.transaction_note}"
             )
         else:
+            self.ignore_cycles_button.configure(state="disabled")
+            self.restore_cycles_button.configure(state="disabled")
             modulus = 1 << (8 * seq_size)
             duplicates = resets = 0
             for previous, current in zip(sequences, sequences[1:]):
@@ -1425,6 +1477,8 @@ class LossAnalyzerApp:
         )
         self.evidence.delete(*self.evidence.get_children())
         self.evidence_rows = []
+        self.ignore_cycles_button.configure(state="disabled")
+        self.restore_cycles_button.configure(state="disabled")
         self.last_report = None
         self.export_button.configure(state="disabled")
         self.evidence_export_button.configure(state="disabled")
@@ -1450,12 +1504,15 @@ class LossAnalyzerApp:
                         gap.estimated_missing, "suspected_missing_from_time_gap_not_sequence_confirmed",
                     ))
             elif self.cyclic_mode:
-                writer.writerow(("cycle", "observed_first", "observed_last", "received_frames", "expected_frames", "missing_frames", "duplicate_frames", "included", "missing_sequence_ids"))
+                writer.writerow(("cycle", "observed_first", "observed_last", "received_frames", "expected_frames", "missing_frames", "duplicate_frames", "included", "ignore_reason", "missing_sequence_ids"))
                 for cycle in self.cycle_results:
+                    manually_ignored = cycle.index in self.manually_ignored_cycles
+                    included = cycle.included and not manually_ignored
+                    reason = "manual" if manually_ignored else "under_coverage" if not cycle.included else ""
                     writer.writerow((
                         cycle.index, cycle.first, cycle.last, cycle.received, cycle.expected,
                         cycle.missing, cycle.duplicates,
-                        "yes" if cycle.included else "ignored_under_50_percent",
+                        "yes" if included else "no", reason,
                         " ".join(map(str, cycle.missing_values)),
                     ))
             else:
